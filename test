@@ -1,0 +1,72 @@
+import cv2
+import numpy as np
+import tflite_runtime.interpreter as tflite
+
+# Load TensorFlow Lite model
+interpreter = tflite.Interpreter(model_path="/home/kandidat/Downloads/ei-esp-eye-box-recog-object-detection-tensorflow-lite-int8-quantized-model.3.lite")
+interpreter.allocate_tensors()
+
+# Get input/output tensor details
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+# Check if model is quantized
+output_scale, output_zero_point = output_details[0]['quantization']
+
+# Video stream from ESP-EYE
+url = "http://192.168.1.12:81/stream"
+cap = cv2.VideoCapture(url)
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        print("Failed to grab frame")
+        break
+
+    # Resize frame to match model input size
+    input_shape = input_details[0]['shape']  # (1, height, width, channels)
+    input_size = (input_shape[1], input_shape[2])  # Extract (height, width)
+    input_data = cv2.resize(frame, input_size)
+
+    # Convert to int8 if model is quantized
+    input_data = np.expand_dims(input_data, axis=0).astype(np.int8)
+
+    # Run inference
+    interpreter.set_tensor(input_details[0]['index'], input_data)
+    interpreter.invoke()
+    output_data = interpreter.get_tensor(output_details[0]['index'])
+
+    # Dequantize output if needed
+    if output_scale > 0:
+        output_data = (output_data.astype(np.float32) - output_zero_point) * output_scale
+
+    # Reshape output if necessary
+    if output_data.shape == (1, 6, 6, 2):  
+        output_data = output_data.reshape(6, 6, 2)  # Adjust shape
+
+    # Get frame dimensions
+    h, w, _ = frame.shape
+
+    # Draw bounding boxes
+    for detection in output_data:
+        x1, y1, x2, y2, class_id, confidence = detection[:, 0]  # Extract first value in each pair
+
+        if confidence > 0.5:  # Only draw high-confidence detections
+            # Convert normalized coordinates (0 to 1) to pixel values
+            x1, y1, x2, y2 = int(x1 * w), int(y1 * h), int(x2 * w), int(y2 * h)
+
+            # Draw rectangle and label
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            label = f"Class {int(class_id)}: {confidence*100:.2f}%"
+            cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    # Show output video
+    cv2.imshow("Object Detection", frame)
+
+    # Press 'q' to exit
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+# Cleanup
+cap.release()
+cv2.destroyAllWindows()
