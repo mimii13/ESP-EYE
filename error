@@ -1,24 +1,26 @@
 import serial
 import time
 
-PORT = "/dev/ttyUSB0"
+PORT = '/dev/ttyUSB0'
 BAUDRATE = 460800
 
-def main():
-    with serial.Serial(PORT, BAUDRATE, timeout=1) as ser:
-        print("[*] Sending scan command...")
-        ser.write(b'\xA5\x60')
-        ser.flush()
-        time.sleep(0.1)
+CMD_STOP  = b'\xA5\x25'
+CMD_SCAN  = b'\xA5\x60'
 
-        print("[*] Dumping raw bytes (CTRL+C to stop)...")
-        try:
-            while True:
-                b = ser.read(1)
-                if b:
-                    print(b.hex(), end=' ', flush=True)
-        except KeyboardInterrupt:
-            print("\n[!] Done.")
+with serial.Serial(PORT, BAUDRATE, timeout=1) as ser:
+    print("[*] Sending STOP command...")
+    ser.write(CMD_STOP)
+    time.sleep(0.1)
 
-if __name__ == '__main__':
-    main()
+    print("[*] Sending SCAN command...")
+    ser.write(CMD_SCAN)
+    time.sleep(0.1)
+
+    print("[*] Reading raw response bytes...")
+    try:
+        while True:
+            b = ser.read(1)
+            if b:
+                print(b.hex(), end=' ', flush=True)
+    except KeyboardInterrupt:
+        print("\n[!] Done.")
