@@ -1,0 +1,58 @@
+import serial
+import struct
+import time
+
+PORT = "/dev/ttyUSB0"
+BAUDRATE = 460800
+
+SYNC_BYTE = 0xA5
+CMD_SCAN = 0x60
+
+def send_command(ser, cmd):
+    ser.write(bytes([SYNC_BYTE, cmd]))
+    ser.flush()
+
+def is_valid_scan_byte(b):
+    return (b & 0x01) == 0x01 and ((b & 0x02) == 0)
+
+def read_scan_frame(ser):
+    while True:
+        # Read one byte to find the start of frame
+        b0 = ser.read(1)
+        if not b0:
+            return None  # Timeout
+        b0 = b0[0]
+        if is_valid_scan_byte(b0):
+            rest = ser.read(4)
+            if len(rest) != 4:
+                continue  # incomplete
+            b1, b2, b3, b4 = rest
+            # Angle: 14-bit from b1 and b2
+            angle_raw = ((b1 >> 1) | (b2 << 7))
+            angle = angle_raw / 64.0
+
+            # Distance: 14-bit from b3 and b4
+            distance_raw = (b3 | (b4 << 8))
+            distance = distance_raw / 4.0  # mm
+
+            return angle, distance
+
+def main():
+    with serial.Serial(PORT, BAUDRATE, timeout=1) as ser:
+        print("[*] Sending start scan command...")
+        send_command(ser, CMD_SCAN)
+
+        print("[*] Attempting to read scan data (no strict descriptor)...")
+        time.sleep(0.1)  # Give it a moment
+
+        try:
+            while True:
+                data = read_scan_frame(ser)
+                if data:
+                    angle, distance = data
+                    print(f"Angle: {angle:6.2f}°, Distance: {distance:7.2f} mm")
+        except KeyboardInterrupt:
+            print("\n[!] Stopped by user.")
+
+if __name__ == "__main__":
+    main()
