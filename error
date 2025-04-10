@@ -61,4 +61,9 @@ def main():
 
                     if result:
                         angle, distance = result
-                        print(f"Angle: {angle
+                        print(f"Angle: {angle:6.2f}°, Distance: {distance:7.2f} mm")
+        except KeyboardInterrupt:
+            print("\n[!] Stopped by user.")
+
+if __name__ == "__main__":
+    main()
