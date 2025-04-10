@@ -1,0 +1,74 @@
+import serial
+import struct
+import time
+
+# CONFIGURATION
+PORT = "/dev/ttyUSB0"  # Adjust if needed
+BAUDRATE = 460800
+
+# COMMANDS
+SYNC_BYTE = 0xA5
+CMD_SCAN = 0x60
+
+# Frame constants (per SDK reverse engineering)
+SCAN_RESPONSE_DESCRIPTOR = b'\xA5\x5A\x05\x00\x00\x00\x81'
+
+def send_command(ser, cmd):
+    ser.write(bytes([SYNC_BYTE, cmd]))
+    ser.flush()
+
+def wait_for_descriptor(ser):
+    desc = ser.read(7)
+    if desc != SCAN_RESPONSE_DESCRIPTOR:
+        raise RuntimeError(f"Unexpected descriptor: {desc.hex()}")
+    print("[✓] Scan descriptor received")
+
+def read_scan_frame(ser):
+    # Each measurement point is 5 bytes
+    raw = ser.read(5)
+    if len(raw) < 5:
+        return None
+
+    # Unpack: byte0 = flag/quality, byte1/2 = angle, byte3/4 = distance
+    byte0, byte1, byte2, byte3, byte4 = struct.unpack('<BBBBB', raw)
+
+    # Bit 0 of byte0 indicates start of a new scan
+    start_flag = (byte0 & 0b1)
+    quality = byte0 >> 2
+
+    # Angle: 14 bits over byte1/2
+    angle_raw = ((byte1 >> 1) | (byte2 << 7))
+    angle = angle_raw / 64.0
+
+    # Distance: 14 bits over byte3/4
+    dist_raw = (byte3 | (byte4 << 8))
+    distance = dist_raw / 4.0  # in mm
+
+    return {
+        'angle': angle,
+        'distance': distance,
+        'quality': quality,
+        'start_flag': start_flag
+    }
+
+def main():
+    with serial.Serial(PORT, BAUDRATE, timeout=1) as ser:
+        print("[*] Sending start scan command...")
+        send_command(ser, CMD_SCAN)
+
+        print("[*] Waiting for scan descriptor...")
+        wait_for_descriptor(ser)
+
+        print("[*] Reading scan data (Press CTRL+C to stop)...")
+        try:
+            while True:
+                frame = read_scan_frame(ser)
+                if frame:
+                    angle = frame['angle']
+                    distance = frame['distance']
+                    print(f"Angle: {angle:6.2f}°, Distance: {distance:7.2f} mm")
+        except KeyboardInterrupt:
+            print("\n[!] Stopped by user.")
+
+if __name__ == "__main__":
+    main()
