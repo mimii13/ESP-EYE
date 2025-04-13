@@ -102,15 +102,21 @@ def visualize_loop():
     fig = plt.figure(figsize=(6, 6))
     ax = fig.add_subplot(111, polar=True)
     line, = ax.plot([], [], marker='o', color='cyan')
-    ax.set_ylim(0, 6000)
+    ax.set_ylim(0.5, 1000)  # Adjusting the limits to show a smaller range with more details
     ax.set_theta_zero_location("N")
     ax.set_theta_direction(-1)
     ax.set_title("RPLIDAR C1 Live Scan (5° resolution)", fontsize=14)
+    
+    # Apply log scale to make closer objects more distinct
+    ax.set_yscale('log')  # Logarithmic scaling for radial axis
 
     while True:
         data = get_lidar_data()
         angles = np.radians(check_angles + [0])  # loop back to 0°
         distances = data + [data[0]]              # same for distance
+
+        # Optional scaling: if you want to normalize the range a bit more
+        # distances = [min(d, 1000) for d in distances]  # Limiting max value if necessary
 
         line.set_data(angles, distances)
         fig.canvas.draw()
