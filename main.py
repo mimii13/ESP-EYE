@@ -10,9 +10,11 @@ CAMERA_PORT = "/dev/ttyUSB1"
 CAMERA_BAUDRATE = 115200
 
 check_angles = [i for i in range(0, 360, 15)]
+angle_tolerance = 2.0  # Degrees
+frame_timeout = 1.0    # Seconds
+
 current_array = [0] * len(check_angles)
 old_array = [0] * len(check_angles)
-count = 0
 
 # Locks and Events
 lidar_lock = Lock()
@@ -49,7 +51,7 @@ def get_descriptor(ser):
         raise Exception("Failed to receive scan descriptor.")
 
 def scan_lidar():
-    global count, current_array, old_array, running
+    global current_array, old_array, running
     ser = None
 
     while running:
@@ -69,35 +71,35 @@ def scan_lidar():
                 continue
 
             lidar_event.clear()
-            frame_collected = False
-            retries = 0
+            filled_flags = [False] * len(check_angles)
+            frame_start = time.time()
 
-            while not frame_collected and retries < 100 and running:
+            while not all(filled_flags) and running:
+                if time.time() - frame_start > frame_timeout:
+                    print("[WARNING] LIDAR frame timeout. Restarting frame.")
+                    filled_flags = [False] * len(check_angles)
+                    frame_start = time.time()
+
                 packet = ser.read(5)
                 if len(packet) != 5:
-                    retries += 1
                     continue
 
                 result = parse_packet(packet)
                 if result is None:
-                    retries += 1
                     continue
 
                 angle, distance, quality = result
-                angle_rounded = round(angle)
 
-                if angle_rounded in check_angles and angle_rounded == check_angles[count]:
-                    with lidar_lock:
-                        current_array[count] = round(distance)
-                        count += 1
-                        if count >= len(check_angles):
-                            count = 0
-                            old_array = current_array[:]
-                            print("[LIDAR] Full frame:", old_array)
-                            frame_collected = True
+                for i, target_angle in enumerate(check_angles):
+                    if not filled_flags[i] and abs(angle - target_angle) <= angle_tolerance:
+                        with lidar_lock:
+                            current_array[i] = round(distance)
+                            filled_flags[i] = True
+                        break
 
-            if not frame_collected:
-                print("[WARNING] Incomplete LIDAR frame.")
+            with lidar_lock:
+                old_array = current_array[:]
+                print("[LIDAR] Full frame:", old_array)
 
             camera_event.set()
 
@@ -115,7 +117,6 @@ def scan_lidar():
             print(f"[EXCEPTION] LIDAR thread error: {e}")
             time.sleep(1)
 
-    # Cleanup
     if ser and ser.is_open:
         try:
             ser.write(CMD_STOP)
@@ -158,7 +159,6 @@ def read_camera_data():
             print(f"[EXCEPTION] Camera thread error: {e}")
             time.sleep(1)
 
-    # Cleanup
     if ser and ser.is_open:
         ser.close()
     print("[INFO] Camera thread exited.")
@@ -178,7 +178,6 @@ def main():
     except KeyboardInterrupt:
         print("\n[INFO] Ctrl+C detected. Shutting down...")
         running = False
-        # Set events to unblock threads
         lidar_event.set()
         camera_event.set()
     finally:
