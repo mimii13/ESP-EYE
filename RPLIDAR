@@ -10,17 +10,18 @@ import numpy as np
 PORT = "/dev/ttyUSB0"
 BAUDRATE = 460800
 
-# --- Commands ---
+# --- LIDAR Commands ---
 CMD_STOP = b'\xA5\x25'
 CMD_SCAN = b'\xA5\x20'
 
-# --- Scan Angles (5-degree steps) ---
-check_angles = [i for i in range(0, 360, 5)]  # [0, 5, 10, ..., 355]
+# --- Angle Setup ---
+check_angles = [i for i in range(0, 360, 5)]  # 5-degree steps
 current_array = [0] * len(check_angles)
 old_array = [0] * len(check_angles)
 count = 0
 lock = Lock()
 
+# --- Parse 5-byte scan packet ---
 def parse_packet(packet):
     if len(packet) != 5:
         return None
@@ -40,11 +41,13 @@ def parse_packet(packet):
 
     return angle, distance, quality
 
+# --- Wait for scan descriptor ---
 def get_descriptor(ser):
     descriptor = ser.read(7)
     if descriptor[:2] != b'\xA5\x5A':
         raise Exception("Failed to receive scan descriptor.")
 
+# --- Main data reading loop ---
 def scan_loop():
     global count, current_array, old_array
 
@@ -70,46 +73,55 @@ def scan_loop():
             angle, distance, quality = result
             angle_rounded = round(angle)
 
-            if angle_rounded == check_angles[count]:
-                with lock:
-                    current_array[count] = round(distance)
-                    count += 1
+            # --- Optional debug print ---
+            # print(f"Angle: {angle:.1f}°, Distance: {distance:.1f} mm, Quality: {quality}")
 
-                    if count >= len(check_angles):
-                        count = 0
+            if angle_rounded == check_angles[count]:
+                # Only accept valid readings
+                if distance > 50 and quality > 0:
+                    with lock:
+                        current_array[count] = round(distance)
+                else:
+                    with lock:
+                        current_array[count] = 0  # Invalid or missing
+
+                count += 1
+                if count >= len(check_angles):
+                    count = 0
+                    with lock:
                         old_array = current_array[:]
 
+# --- Data accessor ---
 def get_lidar_data():
     with lock:
         return old_array[:]
 
+# --- Live radar chart ---
 def visualize_loop():
     plt.ion()
     fig = plt.figure(figsize=(6, 6))
     ax = fig.add_subplot(111, polar=True)
     line, = ax.plot([], [], marker='o', color='cyan')
-    ax.set_ylim(0, 6000)  # Adjust based on expected range (mm)
+    ax.set_ylim(0, 6000)
     ax.set_theta_zero_location("N")
     ax.set_theta_direction(-1)
     ax.set_title("RPLIDAR C1 Live Scan (5° resolution)", fontsize=14)
 
     while True:
         data = get_lidar_data()
-        angles = np.radians(check_angles + [0])  # Close loop
-        distances = data + [data[0]]
+        angles = np.radians(check_angles + [0])  # loop back to 0°
+        distances = data + [data[0]]              # same for distance
 
         line.set_data(angles, distances)
         fig.canvas.draw()
         fig.canvas.flush_events()
         time.sleep(0.1)
 
-# --- MAIN ---
+# --- Start everything ---
 if __name__ == "__main__":
     try:
         reader_thread = threading.Thread(target=scan_loop, daemon=True)
         reader_thread.start()
-
         visualize_loop()
-
     except KeyboardInterrupt:
         print("\n[INFO] Shutting down.")
