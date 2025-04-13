@@ -6,16 +6,16 @@ from threading import Lock
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Serial settings
+# --- Configuration ---
 PORT = "/dev/ttyUSB0"
 BAUDRATE = 460800
 
-# RPLIDAR protocol commands
+# --- Commands ---
 CMD_STOP = b'\xA5\x25'
 CMD_SCAN = b'\xA5\x20'
 
-# Scan angles (every 15°)
-check_angles = [i for i in range(0, 360, 15)]
+# --- Scan Angles (5-degree steps) ---
+check_angles = [i for i in range(0, 360, 5)]  # [0, 5, 10, ..., 355]
 current_array = [0] * len(check_angles)
 old_array = [0] * len(check_angles)
 count = 0
@@ -27,7 +27,6 @@ def parse_packet(packet):
 
     b0, b1, b2, b3, b4 = struct.unpack('<BBBBB', packet)
 
-    # Start and inverted start check
     start_flag = b0 & 0x01
     inv_start_flag = (b0 >> 1) & 0x01
     if start_flag != (~inv_start_flag & 0x01):
@@ -71,10 +70,11 @@ def scan_loop():
             angle, distance, quality = result
             angle_rounded = round(angle)
 
-            if angle_rounded in check_angles and angle_rounded == check_angles[count]:
+            if angle_rounded == check_angles[count]:
                 with lock:
                     current_array[count] = round(distance)
                     count += 1
+
                     if count >= len(check_angles):
                         count = 0
                         old_array = current_array[:]
@@ -85,17 +85,17 @@ def get_lidar_data():
 
 def visualize_loop():
     plt.ion()
-    fig = plt.figure(figsize=(6,6))
+    fig = plt.figure(figsize=(6, 6))
     ax = fig.add_subplot(111, polar=True)
     line, = ax.plot([], [], marker='o', color='cyan')
-    ax.set_ylim(0, 6000)
+    ax.set_ylim(0, 6000)  # Adjust based on expected range (mm)
     ax.set_theta_zero_location("N")
     ax.set_theta_direction(-1)
-    ax.set_title("RPLIDAR C1 Live Scan", fontsize=16)
+    ax.set_title("RPLIDAR C1 Live Scan (5° resolution)", fontsize=14)
 
     while True:
         data = get_lidar_data()
-        angles = np.radians(check_angles + [0])
+        angles = np.radians(check_angles + [0])  # Close loop
         distances = data + [data[0]]
 
         line.set_data(angles, distances)
