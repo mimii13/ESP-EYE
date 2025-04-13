@@ -73,11 +73,8 @@ def scan_loop():
             angle, distance, quality = result
             angle_rounded = round(angle)
 
-            # --- Optional debug print ---
-            # print(f"Angle: {angle:.1f}°, Distance: {distance:.1f} mm, Quality: {quality}")
-
+            # Only accept valid readings
             if angle_rounded == check_angles[count]:
-                # Only accept valid readings
                 if distance > 50 and quality > 0:
                     with lock:
                         current_array[count] = round(distance)
@@ -99,24 +96,30 @@ def get_lidar_data():
 # --- Live radar chart ---
 def visualize_loop():
     plt.ion()
-    fig = plt.figure(figsize=(6, 6))
+    fig = plt.figure(figsize=(8, 8))
     ax = fig.add_subplot(111, polar=True)
-    line, = ax.plot([], [], marker='o', color='cyan')
-    ax.set_ylim(0.5, 1000)  # Adjusting the limits to show a smaller range with more details
+    line, = ax.plot([], [], marker='o', color='cyan', linestyle='-', markersize=4)
+    
+    # Adjusting the range to focus on 5 cm to 3 meters
+    ax.set_ylim(0.05, 3.0)  # Min distance = 5 cm, Max distance = 3 meters
+    
     ax.set_theta_zero_location("N")
     ax.set_theta_direction(-1)
     ax.set_title("RPLIDAR C1 Live Scan (5° resolution)", fontsize=14)
-    
+
     # Apply log scale to make closer objects more distinct
     ax.set_yscale('log')  # Logarithmic scaling for radial axis
 
+    # Optional: Improve grid appearance
+    ax.grid(True, color='gray', linestyle='-', linewidth=0.5)
+
     while True:
         data = get_lidar_data()
-        angles = np.radians(check_angles + [0])  # loop back to 0°
-        distances = data + [data[0]]              # same for distance
+        angles = np.radians(check_angles + [0])  # Loop back to 0°
+        distances = data + [data[0]]              # Same for distance to complete the circle
 
-        # Optional scaling: if you want to normalize the range a bit more
-        # distances = [min(d, 1000) for d in distances]  # Limiting max value if necessary
+        # Optional scaling: limit max value if necessary
+        distances = [min(d, 3000) for d in distances]  # Limiting max distance to 3 meters for better visibility
 
         line.set_data(angles, distances)
         fig.canvas.draw()
