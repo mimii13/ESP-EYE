@@ -6,50 +6,64 @@ import time
 PORT = '/dev/ttyUSB0'
 BAUDRATE = 460800
 
-# --- Scan command bytes (from protocol) ---
+# --- Command bytes ---
 CMD_STOP        = b'\xA5\x25'
 CMD_RESET       = b'\xA5\x40'
 CMD_SCAN        = b'\xA5\x20'
-SCAN_DESCRIPTOR = b'\xA5\x5A'
+CMD_GET_HEALTH  = b'\xA5\x52'
+
+def send_command(ser, cmd):
+    ser.write(cmd)
+
+def get_health(ser):
+    send_command(ser, CMD_GET_HEALTH)
+    descriptor = ser.read(7)
+    if descriptor[0:2] != b'\xA5\x5A':
+        raise Exception("Invalid health descriptor header")
+    payload = ser.read(3)
+    status = payload[0]
+    if status == 0:
+        print("[INFO] LIDAR health OK.")
+    elif status == 1:
+        print("[WARNING] LIDAR health warning.")
+    elif status == 2:
+        raise Exception("[ERROR] LIDAR is in error/protection mode.")
+    else:
+        raise Exception("[ERROR] Unknown health status")
 
 def start_scan(ser):
-    ser.write(CMD_STOP)
+    send_command(ser, CMD_STOP)
     time.sleep(0.05)
 
-    ser.write(CMD_RESET)
-    time.sleep(0.5)
+    send_command(ser, CMD_RESET)
+    time.sleep(1.0)  # Allow time for full reboot
 
-    ser.write(CMD_SCAN)
+    get_health(ser)
 
-    # Expecting descriptor: A5 5A 05 00 00 40 81
+    send_command(ser, CMD_SCAN)
+
+    # Wait for descriptor: A5 5A 05 00 00 40 81
     descriptor = ser.read(7)
     if descriptor[0:2] != b'\xA5\x5A':
         raise Exception("Invalid scan descriptor header")
+
     print("[INFO] Scan started. Descriptor received:", descriptor.hex())
 
 def parse_measurement(raw):
     if len(raw) != 5:
         return None
 
-    # Unpack 5 bytes (little endian)
     b0, b1, b2, b3, b4 = struct.unpack('<BBBBB', raw)
-
-    # Check flags
     check_bit = (b1 & 0x01)
     start_bit = (b0 & 0x01)
     inverted_start_bit = (b0 >> 1) & 0x01
 
     if (start_bit ^ inverted_start_bit) != 1:
-        return None  # invalid packet
+        return None
 
-    # Quality
     quality = b0 >> 2
-
-    # Angle (Q6 format, shift right 1, then divide by 64)
     angle_raw = ((b2 << 7) | (b1 >> 1))
     angle = angle_raw / 64.0
-
-    # Distance (Q2 format, divide by 4)
     distance_raw = (b4 << 8) | b3
     distance = distance_raw / 4.0
 
@@ -69,4 +83,4 @@ with serial.Serial(PORT, BAUDRATE, timeout=1) as ser:
                 print(f"Angle: {angle:.2f}°, Distance: {distance:.2f} mm, Quality: {quality}")
     except KeyboardInterrupt:
         print("\n[INFO] Stopping scan.")
-        ser.write(CMD_STOP)
+        send_command(ser, CMD_STOP)
