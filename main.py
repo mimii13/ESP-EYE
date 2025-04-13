@@ -50,9 +50,9 @@ def parse_packet(packet):
     angle_q6 = ((b2 << 7) | (b1 >> 1))
     angle = angle_q6 / 64.0
     dist_q2 = (b4 << 8) | b3
-    distance = dist_q2 / 4.0
+    distance_cm = (dist_q2 / 4.0) / 10.0  # Convert to cm
 
-    return angle, distance, quality
+    return angle, distance_cm, quality
 
 # Function to get descriptor
 def get_descriptor(ser):
@@ -85,14 +85,14 @@ def scan_lidar():
                 if result is None:
                     continue
 
-                angle, distance, quality = result
+                angle, distance_cm, quality = result
                 angle_rounded = round(angle)
 
-                # Loosen angle match to ±2°
+                # Tighter angle match: ±1°
                 target_angle = check_angles[count]
-                if abs(angle_rounded - target_angle) <= 2:
+                if abs(angle_rounded - target_angle) <= 1:
                     with lidar_lock:
-                        current_array[count] = round(distance)
+                        current_array[count] = round(distance_cm, 1)  # Keep 1 decimal place
                         count += 1
 
                         if count >= len(check_angles):
