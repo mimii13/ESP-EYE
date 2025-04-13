@@ -1,0 +1,93 @@
+import serial
+import time
+import struct
+from threading import Lock
+
+# Serial configuration for RPLIDAR C1
+PORT = "/dev/ttyUSB0"  # Update with your actual port
+BAUDRATE = 460800
+check_angles = [i for i in range(0, 360, 15)]  # 0°, 15°, ..., 345°
+current_array = [0] * len(check_angles)
+old_array = [0] * len(check_angles)
+count = 0
+lock = Lock()
+
+# RPLIDAR Command
+CMD_STOP = b'\xA5\x25'
+CMD_SCAN = b'\xA5\x20'
+
+def parse_packet(packet):
+    if len(packet) != 5:
+        return None
+
+    b0, b1, b2, b3, b4 = struct.unpack('<BBBBB', packet)
+
+    # Validate sync bits
+    start_flag = b0 & 0x01
+    inverted_start_flag = (b0 >> 1) & 0x01
+    if start_flag != (~inverted_start_flag & 0x01):
+        return None
+
+    # Extract quality, angle, distance
+    quality = b0 >> 2
+    angle_q6 = ((b2 << 7) | (b1 >> 1))  # 15 bits
+    angle = angle_q6 / 64.0
+    dist_q2 = (b4 << 8) | b3
+    distance = dist_q2 / 4.0
+
+    return angle, distance, quality
+
+def get_descriptor(ser):
+    descriptor = ser.read(7)
+    if descriptor[:2] != b'\xA5\x5A':
+        raise Exception("Failed to receive scan descriptor.")
+
+def scan_loop():
+    global count, current_array, old_array
+
+    with serial.Serial(PORT, BAUDRATE, timeout=1) as ser:
+        print("[INFO] Starting scan...")
+
+        # Stop and flush any previous state
+        ser.write(CMD_STOP)
+        time.sleep(0.1)
+        ser.reset_input_buffer()
+
+        # Start scan
+        ser.write(CMD_SCAN)
+        get_descriptor(ser)
+        print("[INFO] Scan started.")
+
+        while True:
+            packet = ser.read(5)
+            if len(packet) != 5:
+                ser.reset_input_buffer()
+                continue
+
+            result = parse_packet(packet)
+            if result is None:
+                continue
+
+            angle, distance, quality = result
+            angle_rounded = round(angle)
+
+            # Only keep measurements at 15-degree intervals
+            if angle_rounded in check_angles and angle_rounded == check_angles[count]:
+                with lock:
+                    current_array[count] = round(distance)
+                    count += 1
+
+                    if count >= len(check_angles):
+                        count = 0
+                        old_array = current_array[:]
+                        print("[INFO] Full frame captured:", old_array)
+
+def get_lidar_data():
+    with lock:
+        return old_array[:]
+
+if __name__ == "__main__":
+    try:
+        scan_loop()
+    except KeyboardInterrupt:
+        print("\n[INFO] Stopping scan.")
