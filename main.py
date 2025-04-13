@@ -1,85 +1,82 @@
 import serial
 import time
 import struct
-from threading import Thread, Lock, Event
+from threading import Thread, Lock
+import signal
+import sys
 
-# Configurations
-LIDAR_PORT = "/dev/ttyUSB0"
+# LIDAR Serial Configuration
+LIDAR_PORT = "/dev/ttyUSB0"  # Change to your LIDAR serial port
 LIDAR_BAUDRATE = 460800
-CAMERA_PORT = "/dev/ttyUSB1"
+
+# Camera Serial Configuration
+CAMERA_PORT = "/dev/ttyUSB1"  # Change to your ESP-EYE serial port
 CAMERA_BAUDRATE = 115200
 
-check_angles = [i for i in range(0, 360, 15)]
-angle_tolerance = 2.0  # Degrees
-frame_timeout = 1.0    # Seconds
-
+# Data storage
+check_angles = [i for i in range(0, 360, 15)]  # 0°, 15°, ..., 345°
 current_array = [0] * len(check_angles)
 old_array = [0] * len(check_angles)
+count = 0
 
-# Locks and Events
+# Thread control
 lidar_lock = Lock()
 camera_lock = Lock()
-lidar_event = Event()
-camera_event = Event()
-running = True  # Controls main loops
-
-# Start with LIDAR
-lidar_event.set()
+running = True  # Shared flag for clean shutdown
 
 # LIDAR Commands
 CMD_STOP = b'\xA5\x25'
 CMD_SCAN = b'\xA5\x20'
 
+def signal_handler(sig, frame):
+    global running
+    print("\n[INFO] Caught interrupt signal. Stopping program...")
+    running = False
+
+# Function to parse LIDAR packet
 def parse_packet(packet):
     if len(packet) != 5:
         return None
     b0, b1, b2, b3, b4 = struct.unpack('<BBBBB', packet)
+
+    # Validate sync bits
     start_flag = b0 & 0x01
     inverted_start_flag = (b0 >> 1) & 0x01
     if start_flag != (~inverted_start_flag & 0x01):
         return None
+
+    # Extract quality, angle, distance
     quality = b0 >> 2
     angle_q6 = ((b2 << 7) | (b1 >> 1))
     angle = angle_q6 / 64.0
     dist_q2 = (b4 << 8) | b3
     distance = dist_q2 / 4.0
+
     return angle, distance, quality
 
+# Function to get descriptor
 def get_descriptor(ser):
     descriptor = ser.read(7)
     if descriptor[:2] != b'\xA5\x5A':
         raise Exception("Failed to receive scan descriptor.")
 
+# LIDAR scan thread
 def scan_lidar():
-    global current_array, old_array, running
-    ser = None
+    global count, current_array, old_array, running
 
-    while running:
+    with serial.Serial(LIDAR_PORT, LIDAR_BAUDRATE, timeout=1) as ser:
+        print("[INFO] Starting LIDAR scan...")
+
+        ser.write(CMD_STOP)
+        time.sleep(0.1)
+        ser.reset_input_buffer()
+
+        ser.write(CMD_SCAN)
+        get_descriptor(ser)
+        print("[INFO] LIDAR scan started.")
+
         try:
-            if ser is None or not ser.is_open:
-                ser = serial.Serial(LIDAR_PORT, LIDAR_BAUDRATE, timeout=1)
-                ser.write(CMD_STOP)
-                time.sleep(0.1)
-                ser.reset_input_buffer()
-                ser.write(CMD_SCAN)
-                get_descriptor(ser)
-                print("[INFO] LIDAR scan started.")
-
-            if not lidar_event.wait(timeout=5):
-                print("[ERROR] LIDAR event timeout.")
-                camera_event.set()
-                continue
-
-            lidar_event.clear()
-            filled_flags = [False] * len(check_angles)
-            frame_start = time.time()
-
-            while not all(filled_flags) and running:
-                if time.time() - frame_start > frame_timeout:
-                    print("[WARNING] LIDAR frame timeout. Restarting frame.")
-                    filled_flags = [False] * len(check_angles)
-                    frame_start = time.time()
-
+            while running:
                 packet = ser.read(5)
                 if len(packet) != 5:
                     continue
@@ -89,103 +86,59 @@ def scan_lidar():
                     continue
 
                 angle, distance, quality = result
+                angle_rounded = round(angle)
 
-                for i, target_angle in enumerate(check_angles):
-                    if not filled_flags[i] and abs(angle - target_angle) <= angle_tolerance:
-                        with lidar_lock:
-                            current_array[i] = round(distance)
-                            filled_flags[i] = True
-                        break
+                # Loosen angle match to ±2°
+                target_angle = check_angles[count]
+                if abs(angle_rounded - target_angle) <= 2:
+                    with lidar_lock:
+                        current_array[count] = round(distance)
+                        count += 1
 
-            with lidar_lock:
-                old_array = current_array[:]
-                print("[LIDAR] Full frame:", old_array)
+                        if count >= len(check_angles):
+                            count = 0
+                            old_array = current_array[:]
+                            print("[INFO] Full LIDAR frame captured:", old_array)
 
-            camera_event.set()
-
-        except serial.SerialException as e:
-            print(f"[ERROR] LIDAR serial error: {e}. Reconnecting...")
-            if ser:
-                try:
-                    ser.write(CMD_STOP)
-                except:
-                    pass
-                ser.close()
-                ser = None
-            time.sleep(1)
         except Exception as e:
-            print(f"[EXCEPTION] LIDAR thread error: {e}")
-            time.sleep(1)
-
-    if ser and ser.is_open:
-        try:
+            print("[ERROR] LIDAR thread exception:", e)
+        finally:
+            print("[INFO] Stopping LIDAR...")
             ser.write(CMD_STOP)
+            time.sleep(0.1)
             ser.close()
-        except:
-            pass
-    print("[INFO] LIDAR thread exited.")
 
+# Camera thread
 def read_camera_data():
     global running
-    ser = None
-
-    while running:
+    with serial.Serial(CAMERA_PORT, CAMERA_BAUDRATE, timeout=1) as ser:
+        print("[INFO] Reading Camera Data from ESP-EYE...")
         try:
-            if ser is None or not ser.is_open:
-                ser = serial.Serial(CAMERA_PORT, CAMERA_BAUDRATE, timeout=1)
-                print("[INFO] Camera connected.")
-
-            if not camera_event.wait(timeout=5):
-                print("[ERROR] Camera event timeout.")
-                lidar_event.set()
-                continue
-
-            camera_event.clear()
-
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if line:
-                with camera_lock:
-                    print("[Camera] ", line)
-
-            lidar_event.set()
-
-        except serial.SerialException as e:
-            print(f"[ERROR] Camera serial error: {e}. Reconnecting...")
-            if ser:
-                ser.close()
-                ser = None
-            time.sleep(1)
+            while running:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                if line:
+                    with camera_lock:
+                        print("[Camera Data] ", line)
         except Exception as e:
-            print(f"[EXCEPTION] Camera thread error: {e}")
-            time.sleep(1)
+            print("[ERROR] Camera thread exception:", e)
+        finally:
+            print("[INFO] Stopping Camera...")
+            ser.close()
 
-    if ser and ser.is_open:
-        ser.close()
-    print("[INFO] Camera thread exited.")
-
+# Main
 def main():
-    global running
+    signal.signal(signal.SIGINT, signal_handler)
 
-    try:
-        lidar_thread = Thread(target=scan_lidar)
-        camera_thread = Thread(target=read_camera_data)
+    lidar_thread = Thread(target=scan_lidar)
+    camera_thread = Thread(target=read_camera_data)
 
-        lidar_thread.start()
-        camera_thread.start()
+    lidar_thread.start()
+    camera_thread.start()
 
-        while True:
-            time.sleep(0.5)  # Keep main thread alive
-    except KeyboardInterrupt:
-        print("\n[INFO] Ctrl+C detected. Shutting down...")
-        running = False
-        lidar_event.set()
-        camera_event.set()
-    finally:
-        print("[INFO] Waiting for threads to finish...")
-        lidar_thread.join()
-        camera_thread.join()
-        print("[INFO] Shutdown complete.")
+    lidar_thread.join()
+    camera_thread.join()
+    print("[INFO] Program finished cleanly.")
 
 if __name__ == "__main__":
-    print("[START] LIDAR + Camera synchronized reader")
+    print("Starting both LIDAR and Camera sensors.")
     main()
