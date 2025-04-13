@@ -1,86 +1,96 @@
 import serial
-import struct
 import time
+import struct
+from threading import Lock
 
-# --- Configuration ---
-PORT = '/dev/ttyUSB0'
+# Serial configuration
+PORT = "/dev/ttyUSB0"
 BAUDRATE = 460800
 
-# --- Command bytes ---
-CMD_STOP        = b'\xA5\x25'
-CMD_RESET       = b'\xA5\x40'
-CMD_SCAN        = b'\xA5\x20'
-CMD_GET_HEALTH  = b'\xA5\x52'
+# Storage for processed data
+check_angles = [i for i in range(0, 360, 15)]  # 0°, 15°, ..., 345°
+current_array = [0] * len(check_angles)
+old_array = [0] * len(check_angles)
+count = 0
+lock = Lock()
 
-def send_command(ser, cmd):
-    ser.write(cmd)
+# Start command
+CMD_STOP = b'\xA5\x25'
+CMD_SCAN = b'\xA5\x20'
 
-def get_health(ser):
-    send_command(ser, CMD_GET_HEALTH)
-    descriptor = ser.read(7)
-    if descriptor[0:2] != b'\xA5\x5A':
-        raise Exception("Invalid health descriptor header")
-    payload = ser.read(3)
-    status = payload[0]
-    if status == 0:
-        print("[INFO] LIDAR health OK.")
-    elif status == 1:
-        print("[WARNING] LIDAR health warning.")
-    elif status == 2:
-        raise Exception("[ERROR] LIDAR is in error/protection mode.")
-    else:
-        raise Exception("[ERROR] Unknown health status")
-
-def start_scan(ser):
-    send_command(ser, CMD_STOP)
-    time.sleep(0.05)
-
-    send_command(ser, CMD_RESET)
-    time.sleep(1.0)  # Allow time for full reboot
-
-    get_health(ser)
-
-    send_command(ser, CMD_SCAN)
-
-    # Wait for descriptor: A5 5A 05 00 00 40 81
-    descriptor = ser.read(7)
-    if descriptor[0:2] != b'\xA5\x5A':
-        raise Exception("Invalid scan descriptor header")
-
-    print("[INFO] Scan started. Descriptor received:", descriptor.hex())
-
-def parse_measurement(raw):
-    if len(raw) != 5:
+def parse_packet(packet):
+    if len(packet) != 5:
         return None
 
-    b0, b1, b2, b3, b4 = struct.unpack('<BBBBB', raw)
-    check_bit = (b1 & 0x01)
-    start_bit = (b0 & 0x01)
-    inverted_start_bit = (b0 >> 1) & 0x01
+    b0, b1, b2, b3, b4 = struct.unpack('<BBBBB', packet)
 
-    if (start_bit ^ inverted_start_bit) != 1:
+    # Validate sync bits
+    start_flag = b0 & 0x01
+    inverted_start_flag = (b0 >> 1) & 0x01
+    if start_flag != (~inverted_start_flag & 0x01):
         return None
 
+    # Extract quality, angle, distance
     quality = b0 >> 2
-    angle_raw = ((b2 << 7) | (b1 >> 1))
-    angle = angle_raw / 64.0
-    distance_raw = (b4 << 8) | b3
-    distance = distance_raw / 4.0
+    angle_q6 = ((b2 << 7) | (b1 >> 1))  # 15 bits
+    angle = angle_q6 / 64.0
+    dist_q2 = (b4 << 8) | b3
+    distance = dist_q2 / 4.0
 
-    return (angle, distance, quality)
+    return angle, distance, quality
 
-# --- Main execution ---
-with serial.Serial(PORT, BAUDRATE, timeout=1) as ser:
-    start_scan(ser)
+def get_descriptor(ser):
+    descriptor = ser.read(7)
+    if descriptor[:2] != b'\xA5\x5A':
+        raise Exception("Failed to receive scan descriptor.")
+    # Optionally validate rest: descriptor[2:] == b'\x05\x00\x00\x40\x81'
 
-    print("[INFO] Receiving measurements... Press CTRL+C to stop.")
-    try:
+def scan_loop():
+    global count, current_array, old_array
+
+    with serial.Serial(PORT, BAUDRATE, timeout=1) as ser:
+        print("[INFO] Starting scan...")
+
+        # Stop and flush any previous state
+        ser.write(CMD_STOP)
+        time.sleep(0.1)
+        ser.reset_input_buffer()
+
+        # Start scan
+        ser.write(CMD_SCAN)
+        get_descriptor(ser)
+        print("[INFO] Scan started.")
+
         while True:
-            raw = ser.read(5)
-            result = parse_measurement(raw)
-            if result:
-                angle, distance, quality = result
-                print(f"Angle: {angle:.2f}°, Distance: {distance:.2f} mm, Quality: {quality}")
+            packet = ser.read(5)
+            if len(packet) != 5:
+                ser.reset_input_buffer()
+                continue
+
+            result = parse_packet(packet)
+            if result is None:
+                continue
+
+            angle, distance, quality = result
+            angle_rounded = round(angle)
+
+            # Only keep measurements at 15-degree intervals
+            if angle_rounded in check_angles and angle_rounded == check_angles[count]:
+                with lock:
+                    current_array[count] = round(distance)
+                    count += 1
+
+                    if count >= len(check_angles):
+                        count = 0
+                        old_array = current_array[:]
+                        print("[INFO] Full frame captured:", old_array)
+
+def get_lidar_data():
+    with lock:
+        return old_array[:]
+
+if __name__ == "__main__":
+    try:
+        scan_loop()
     except KeyboardInterrupt:
         print("\n[INFO] Stopping scan.")
-        send_command(ser, CMD_STOP)
