@@ -21,6 +21,10 @@ lidar_lock = Lock()
 # Lock to prevent race condition for camera data
 camera_lock = Lock()
 
+# Control turn variable
+turn_lock = Lock()
+turn = "lidar"  # The first sensor to output (LIDAR)
+
 # LIDAR Commands
 CMD_STOP = b'\xA5\x25'
 CMD_SCAN = b'\xA5\x20'
@@ -92,6 +96,12 @@ def scan_lidar():
                         count = 0
                         old_array = current_array[:]
                         print("[INFO] Full LIDAR frame captured:", old_array)
+            
+            # Control output alternating between lidar and camera
+            with turn_lock:
+                if turn == "lidar":
+                    print("[LIDAR] Full frame captured:", old_array)
+                    turn = "camera"  # Switch turn to camera
 
 # Camera reading loop
 def read_camera_data():
@@ -102,7 +112,13 @@ def read_camera_data():
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
                 if line:
                     with camera_lock:
-                        print("[Camera Data] ", line)
+                        print("[Camera] ", line)
+
+                # Control output alternating between lidar and camera
+                with turn_lock:
+                    if turn == "camera":
+                        print("[Camera] ", line)
+                        turn = "lidar"  # Switch turn to lidar
         except KeyboardInterrupt:
             print("\nStopping Camera reading.")
         finally:
