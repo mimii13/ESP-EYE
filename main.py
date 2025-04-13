@@ -58,7 +58,7 @@ def get_descriptor(ser):
 
 # LIDAR scan loop
 def scan_lidar():
-    global count, current_array, old_array
+    global count, current_array, old_array, turn  # Declare turn as global
 
     with serial.Serial(LIDAR_PORT, LIDAR_BAUDRATE, timeout=1) as ser:
         print("[INFO] Starting LIDAR scan...")
@@ -105,6 +105,8 @@ def scan_lidar():
 
 # Camera reading loop
 def read_camera_data():
+    global turn  # Declare turn as global
+
     with serial.Serial(CAMERA_PORT, CAMERA_BAUDRATE, timeout=1) as ser:
         print("Reading Camera Data from ESP-EYE...")
         try:
