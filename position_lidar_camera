@@ -1,0 +1,158 @@
+import serial
+import time
+import struct
+from threading import Thread, Lock
+import signal
+import sys
+
+# Serial Ports
+LIDAR_PORT = "/dev/ttyUSB0"
+CAMERA_PORT = "/dev/ttyUSB1"
+DWM1001_PORT = "/dev/ttyUSB2"
+
+# Baud Rates
+LIDAR_BAUDRATE = 460800
+CAMERA_BAUDRATE = 115200
+DWM1001_BAUDRATE = 115200
+
+# Data Lists
+check_angles = [i for i in range(0, 360, 15)]
+current_array = [0] * len(check_angles)
+
+# Shared Data with Locks
+data_lock = Lock()
+shared_data = {
+    "camera": "unknown",
+    "position": "unknown",
+    "distances": [0] * len(check_angles)
+}
+
+count = 0
+running = True
+
+# Signal Handler
+def signal_handler(sig, frame):
+    global running
+    print("\n[INFO] Stopping all threads...")
+    running = False
+
+# Parse LIDAR packet
+def parse_packet(packet):
+    if len(packet) != 5:
+        return None
+    b0, b1, b2, b3, b4 = struct.unpack('<BBBBB', packet)
+    if (b0 & 0x01) != ((~(b0 >> 1)) & 0x01):
+        return None
+    quality = b0 >> 2
+    angle_q6 = ((b2 << 7) | (b1 >> 1))
+    angle = angle_q6 / 64.0
+    dist_q2 = (b4 << 8) | b3
+    distance_cm = (dist_q2 / 4.0) / 10.0
+    return angle, distance_cm, quality
+
+# Get descriptor
+def get_descriptor(ser):
+    descriptor = ser.read(7)
+    if descriptor[:2] != b'\xA5\x5A':
+        raise Exception("LIDAR scan descriptor failed.")
+
+# LIDAR Thread
+def scan_lidar():
+    global count, current_array, running
+    with serial.Serial(LIDAR_PORT, LIDAR_BAUDRATE, timeout=1) as ser:
+        print("[INFO] LIDAR starting...")
+        ser.write(b'\xA5\x25')
+        time.sleep(0.1)
+        ser.reset_input_buffer()
+        ser.write(b'\xA5\x20')
+        get_descriptor(ser)
+
+        try:
+            while running:
+                packet = ser.read(5)
+                if len(packet) != 5:
+                    continue
+                result = parse_packet(packet)
+                if result is None:
+                    continue
+                angle, distance_cm, quality = result
+                angle_rounded = round(angle)
+                target_angle = check_angles[count]
+                if abs(angle_rounded - target_angle) <= 1:
+                    current_array[count] = round(distance_cm, 1)
+                    count += 1
+                    if count >= len(check_angles):
+                        with data_lock:
+                            shared_data["distances"] = current_array[:]
+                        count = 0
+                        print_unified_output()
+        except Exception as e:
+            print("[ERROR] LIDAR thread:", e)
+        finally:
+            ser.write(b'\xA5\x25')
+            time.sleep(0.1)
+            print("[INFO] LIDAR stopped.")
+
+# Camera Thread
+def read_camera_data():
+    global running
+    with serial.Serial(CAMERA_PORT, CAMERA_BAUDRATE, timeout=1) as ser:
+        print("[INFO] Camera reading started...")
+        try:
+            while running:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                if line:
+                    with data_lock:
+                        shared_data["camera"] = line
+        except Exception as e:
+            print("[ERROR] Camera thread:", e)
+        finally:
+            print("[INFO] Camera stopped.")
+
+# Position Thread
+def read_position_data():
+    global running
+    with serial.Serial(DWM1001_PORT, DWM1001_BAUDRATE, timeout=1) as ser:
+        print("[INFO] Position reading started...")
+        try:
+            while running:
+                ser.write(b'lep\n')
+                time.sleep(0.3)
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                if line.startswith('POS'):
+                    with data_lock:
+                        shared_data["position"] = line
+        except Exception as e:
+            print("[ERROR] Position thread:", e)
+        finally:
+            print("[INFO] Position reader stopped.")
+
+# Unified Output
+def print_unified_output():
+    with data_lock:
+        print("\n[Unified Data]")
+        print(f"Camera: {shared_data['camera']}")
+        print(f"Position: {shared_data['position']}")
+        print(f"Distances: {shared_data['distances']}\n")
+
+# Main
+def main():
+    signal.signal(signal.SIGINT, signal_handler)
+
+    threads = [
+        Thread(target=scan_lidar),
+        Thread(target=read_camera_data),
+        Thread(target=read_position_data)
+    ]
+
+    for t in threads:
+        t.start()
+
+    for t in threads:
+        t.join()
+
+    print("[INFO] Program finished.")
+
+if __name__ == "__main__":
+    print("Starting LIDAR, Camera, and Position tracking...")
+    main()
