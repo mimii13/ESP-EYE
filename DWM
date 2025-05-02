@@ -1,0 +1,79 @@
+import json
+import redis
+import serial
+import sys
+import time
+from art import text2art
+
+if len(sys.argv) == 1:
+    print("Please provide a numeric value for the first down")
+    print("Example: python first_down.py 0.18")
+    sys.exit()
+
+try:
+    first_down = float(sys.argv[1])
+    print("Initial First Down is at {}".format(first_down))
+except ValueError:
+    print("Please provide a float value for the argument (first down)")
+    print("Example: python first_down.py 0.18")
+    sys.exit()
+
+first_down_art = text2art(text="FIRST DOWN!", font="3d-diagonal")
+
+# Connect to Redis on port 7001
+r = redis.Redis(host='localhost', port=7001, db=0)
+
+# Connect to Decawave tag via UART (/dev/ttyAMA0)
+DWM = serial.Serial(port="/dev/ttyAMA0", baudrate=115200)
+print("Connected to " + DWM.name)
+
+# Two carriage returns to initiate communication with Decawave tag
+DWM.write("\r\r".encode())
+print("Encode")
+time.sleep(1)
+
+# Tell Decawave board to start sending data
+DWM.write("lec\r".encode())
+print("Encode")
+time.sleep(1)
+
+try:
+    while True:
+        data = DWM.readline()
+        if data:
+            print(data)
+            # If the data includes locations for each anchor, parse it
+            if ("DIST".encode() in data and "AN0".encode() in data and "AN1".encode() in data and "AN2".encode() in data):
+                data = data.replace("\r\n".encode(), "".encode())
+                data = data.decode().split(",")
+                if "DIST" in data:
+                    anchor_number = int(data[data.index("DIST") + 1])
+                    for i in range(anchor_number):
+                        pos_AN = {
+                            "id": data[data.index("AN" + str(i)) + 1],
+                            "x": data[data.index("AN" + str(i)) + 2],
+                            "y": data[data.index("AN" + str(i)) + 3],
+                            "z": data[data.index("AN" + str(i)) + 4],
+                            "dist": data[data.index("AN" + str(i)) + 5]
+                        }
+                        pos_AN = json.dumps(pos_AN)
+                        print(pos_AN)
+                        r.set('AN' + str(i), pos_AN)
+            # If there is position data for the tag
+            if "POS" in data:
+                x_pos = data[data.index("POS") + 1]
+                y_pos = data[data.index("POS") + 2]
+                z_pos = data[data.index("POS") + 3]
+                pos = {"x": x_pos, "y": y_pos, "z": z_pos}
+                pos = json.dumps(pos)
+                print(pos)
+                if float(x_pos) > first_down:
+                    print(first_down_art)
+                    first_down += 0.2
+                    print("New first down is at {}".format(first_down))
+                r.set("pos", pos)
+    DWM.write("\r".encode())
+    DWM.close()
+
+except KeyboardInterrupt:
+    print("Stop")
