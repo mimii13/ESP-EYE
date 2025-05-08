@@ -1,0 +1,120 @@
+import RPi.GPIO as GPIO
+import time
+import math
+import json
+from pathlib import Path
+
+# ----- GPIO-konfiguration för HM55B -----
+PIN_EN = 17
+PIN_CLK = 27
+PIN_DIN = 23
+PIN_DOUT = 22
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(PIN_EN, GPIO.OUT)
+GPIO.setup(PIN_CLK, GPIO.OUT)
+GPIO.setup(PIN_DIN, GPIO.OUT)
+GPIO.setup(PIN_DOUT, GPIO.IN)
+
+# ----- Funktioner för att kommunicera med HM55B -----
+def pulse_clock():
+    GPIO.output(PIN_CLK, True)
+    time.sleep(0.00001)
+    GPIO.output(PIN_CLK, False)
+    time.sleep(0.00001)
+
+def shift_out(data, bits=4):
+    for i in range(bits):
+        bit = (data >> (bits - 1 - i)) & 1
+        GPIO.output(PIN_DIN, bit)
+        pulse_clock()
+
+def shift_in(bits=4):
+    value = 0
+    for _ in range(bits):
+        pulse_clock()
+        value <<= 1
+        if GPIO.input(PIN_DOUT):
+            value |= 1
+    return value
+
+def reset_compass():
+    GPIO.output(PIN_EN, True)
+    time.sleep(0.001)
+    GPIO.output(PIN_EN, False)
+    shift_out(0b0000)
+    GPIO.output(PIN_EN, True)
+
+def start_measurement():
+    GPIO.output(PIN_EN, False)
+    shift_out(0b1000)
+    GPIO.output(PIN_EN, True)
+
+def wait_for_ready():
+    while True:
+        GPIO.output(PIN_EN, False)
+        shift_out(0b1100)
+        status = shift_in(4)
+        GPIO.output(PIN_EN, True)
+        if status == 0b1100:
+            break
+        time.sleep(0.005)
+
+def read_axes():
+    GPIO.output(PIN_EN, False)
+    shift_out(0b1100)
+    _ = shift_in(4)  # status
+    x = shift_in(11)
+    y = shift_in(11)
+    GPIO.output(PIN_EN, True)
+
+    if x & 0x400: x -= 0x800
+    if y & 0x400: y -= 0x800
+    return x, y
+
+def get_avg_axes(samples=10):
+    xs, ys = [], []
+    for _ in range(samples):
+        reset_compass()
+        start_measurement()
+        wait_for_ready()
+        x, y = read_axes()
+        xs.append(x)
+        ys.append(y)
+        time.sleep(0.02)
+    return sum(xs) / len(xs), sum(ys) / len(ys)
+
+# ----- Kalibreringslogik -----
+def calibrate():
+    print("\n  Börjar kalibrering av HM55B")
+    print("  Sätt AGV:n i rätt riktning, tryck [Enter] för varje steg.")
+    directions = ["NORD", "ÖST", "SYD", "VÄST"]
+    measurements = {}
+
+    for dir in directions:
+        input(f"\n Rikta AGV mot {dir} och tryck [Enter]...")
+        x, y = get_avg_axes()
+        print(f"  {dir}: x = {x:.1f}, y = {y:.1f}")
+        measurements[dir] = {"x": x, "y": y}
+
+    # Beräkna offset
+    x_offset = (measurements["NORD"]["x"] + measurements["SYD"]["x"]) / 2
+    y_offset = (measurements["ÖST"]["y"] + measurements["VÄST"]["y"]) / 2
+
+    print("\n Kalibrering klar!")
+    print(f"  x_offset = {x_offset:.2f}")
+    print(f"  y_offset = {y_offset:.2f}")
+
+    # Spara till fil
+    data = {"x_offset": x_offset, "y_offset": y_offset}
+    with open("compass_calibration.json", "w") as f:
+        json.dump(data, f, indent=2)
+    print("\n💾 Sparade offset-värden i compass_calibration.json")
+
+# ----- Kör kalibreringen -----
+try:
+    calibrate()
+except KeyboardInterrupt:
+    print("\nAvbruten.")
+finally:
+    GPIO.cleanup()
