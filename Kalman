@@ -33,13 +33,11 @@ kalman_y = {
     'v': 0.0,
     'P': np.array([[1, 0], [0, 1]], dtype=np.float32)
 }
-Q = np.array([[0.1, 0], [0, 0.1]])  # process noise
-R = 100.0  # measurement noise
-dt = 0.1  # tidssteg
-
+Q = np.array([[0.1, 0], [0, 0.1]])
+R = 100.0
+dt = 0.1
 
 def kalman_update(kalman_state, acc, measurement=None):
-    # Prediction step
     A = np.array([[1, dt], [0, 1]])
     B = np.array([[0.5 * dt**2], [dt]])
     x = np.array([[kalman_state['x']], [kalman_state['v']]])
@@ -65,12 +63,10 @@ def kalman_update(kalman_state, acc, measurement=None):
     kalman_state['P'] = P_new
     return kalman_state['x']
 
-
 def get_descriptor(ser):
     descriptor = ser.read(7)
     if descriptor[:2] != b'\xA5\x5A':
         raise Exception("Misslyckades med att ta emot scan descriptor")
-
 
 def parse_packet(packet):
     if len(packet) != 5:
@@ -86,7 +82,6 @@ def parse_packet(packet):
     dist_q2 = (b4 << 8) | b3
     distance_cm = round((dist_q2 / 4.0) / 10.0)
     return angle, max(0, distance_cm), quality
-
 
 def lidar_task(client_sock):
     global lidar_active
@@ -126,9 +121,10 @@ def lidar_task(client_sock):
         except:
             pass
 
-
 def dwm_position_task(client_sock):
     global x, y
+    ax = 0.0
+    ay = 0.0
     try:
         with serial.Serial("/dev/ttyACM0", 115200, timeout=1) as ser:
             ser.write(b"\r")
@@ -145,6 +141,7 @@ def dwm_position_task(client_sock):
             time.sleep(0.2)
             print("[AGV] DWM-positionering startad.")
             while True:
+                # Läs ESP32 först
                 if esp_serial.in_waiting:
                     esp_line = esp_serial.readline().decode().strip()
                     if esp_line.startswith("mpu:"):
@@ -154,21 +151,22 @@ def dwm_position_task(client_sock):
                             ay = float(parts[1].split(":")[1])
                         except Exception as e:
                             print("[Kalman] Fel vid parsing av MPU:", e)
-                            continue
-                line = ser.readline().decode("utf-8").strip()
-                if line.startswith("POS,"):
-                    parts = line.split(",")
-                    if len(parts) >= 3:
-                        raw_x = float(parts[1]) * 100.0
-                        raw_y = float(parts[2]) * 100.0
-                        x_filtered = kalman_update(kalman_x, ax, raw_x)
-                        y_filtered = kalman_update(kalman_y, ay, raw_y)
-                        x, y = round(x_filtered), round(y_filtered)
-                        client_sock.send(f"POS:{x},{y}\r\n".encode("utf-8"))
-                        print(f"[AGV] Kalman POS: {x},{y}")
+
+                # Läs DWM-position
+                if ser.in_waiting:
+                    line = ser.readline().decode("utf-8").strip()
+                    if line.startswith("POS,"):
+                        parts = line.split(",")
+                        if len(parts) >= 3:
+                            raw_x = float(parts[1]) * 100.0
+                            raw_y = float(parts[2]) * 100.0
+                            x_filtered = kalman_update(kalman_x, ax, raw_x)
+                            y_filtered = kalman_update(kalman_y, ay, raw_y)
+                            x, y = round(x_filtered), round(y_filtered)
+                            client_sock.send(f"POS:{x},{y}\r\n".encode("utf-8"))
+                            print(f"[AGV] Kalman POS: {x},{y}")
     except Exception as e:
         print("[AGV] DWM-fel:", e)
-
 
 def send_move_commands(esp_serial, target_x, target_y, angle):
     global x, y
@@ -181,7 +179,7 @@ def send_move_commands(esp_serial, target_x, target_y, angle):
         return
     dx = target_x - x
     dy = target_y - y
-    esp_serial.write(b'0')  # Simpel frammot
+    esp_serial.write(b'0')
     while abs(dx) > 10 or abs(dy) > 10:
         time.sleep(1)
         esp_serial.write(b'0')
@@ -189,7 +187,6 @@ def send_move_commands(esp_serial, target_x, target_y, angle):
         dy = target_y - y
     if abs(dx) <= 3 and abs(dy) <= 3:
         esp_serial.write(b'9')
-
 
 COMMAND_FILE = "command.txt"
 server_sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
