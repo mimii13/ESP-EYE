@@ -35,6 +35,10 @@ void setup() {
 Serial.begin(115200); // USB debug
 Serial2.begin(115200, SERIAL_8N1, RXD2, TXD2); // UART2 for Pi
 
+const int V = 7.2;
+int mesV = 8; 
+int ratV = V/mesV;
+
 pinMode(pwmPinRF, OUTPUT);
 pinMode(pwmPinRB, OUTPUT);
 pinMode(pwmPinLF, OUTPUT);
@@ -69,7 +73,12 @@ void loop() {
   char received = Serial2.read(); // ✅ FIXED: Read from Serial2
   Serial.print("Received command: "); // Print to USB monitor
   Serial.println(received); 
-  //
+
+
+  //Voltage 7.2
+  const int rotRT = 2700;
+  const int rotLT = 2800;
+
   int n = 0;
 
   if (received == '2'){ // 45 grader
@@ -109,7 +118,7 @@ void loop() {
 
     case '2':
       rotR();
-      delay(2430*n/2);
+      delay(rotRT*n/2);
       Serial2.println("ACK: Rotate Right with 45 degrees");
       stop();
       n = 0;
@@ -117,7 +126,7 @@ void loop() {
 
     case '3':
       rotR();
-      delay(2430*n/2);
+      delay(rotRT*n/2);
       Serial2.println("ACK: Rotate Right with 90 degrees");
       stop();
       n = 0;
@@ -125,7 +134,7 @@ void loop() {
 
     case '4':
       rotR();
-      delay(2430*n/2);
+      delay(rotRT*n/2);
       Serial2.println("ACK: Rotate Right with 135 degrees");
       stop();
       n = 0;
@@ -133,7 +142,7 @@ void loop() {
 
     case '5':
       rotL();
-      delay(2430*n/2);
+      delay(rotLT*n/2);
       Serial2.println("ACK: Rotate Left with 180 degrees");
       stop();
       n = 0;
@@ -141,7 +150,7 @@ void loop() {
 
     case '6':
       rotL();
-      delay(2430*n/2);
+      delay(rotLT*n/2);
       Serial2.println("ACK: Rotate Left with 45 degrees");
       stop();
       n = 0;
@@ -149,7 +158,7 @@ void loop() {
 
     case '7':
       rotL();
-      delay(2430*n/2);
+      delay(rotLT*n/2);
       Serial2.println("ACK: Rotate Left with 90 degrees");
       stop();
       n = 0;
@@ -157,7 +166,7 @@ void loop() {
 
     case '8':
       rotL();
-      delay(2430*n/2);
+      delay(rotLT*n/2);
       Serial2.println("ACK: Rotate Left with 135 degrees");
       stop();
       n = 0;
@@ -229,7 +238,7 @@ ledcWrite(pwmPinLB, 0);
 
 
 void forwardR(){
-ledcWrite(pwmPinRF, 148); // Motor R Forward speed prev 120
+ledcWrite(pwmPinRF, 74); // Motor R Forward speed prev 120
 ledcWrite(pwmPinRB, 0); // Motor R Backward speed = 0
 }
 
@@ -239,7 +248,7 @@ ledcWrite(pwmPinRF, 0); // Motor R Forward speed = 0
 }
 
 void forwardL(){
-ledcWrite(pwmPinLF, 151); // Motor L Forward speed
+ledcWrite(pwmPinLF,75); // Motor L Forward speed
 ledcWrite(pwmPinLB, 0); // Motor L Backward speed = 0
 }
 
@@ -249,22 +258,22 @@ ledcWrite(pwmPinLF, 0); // Motor L Forward speed = 0
 }
 
 void forwardR1(){
-ledcWrite(pwmPinRF, 65); // Motor R Forward speed prev 40
+ledcWrite(pwmPinRF, 70); // Motor R Forward speed prev 40
 ledcWrite(pwmPinRB, 0); // Motor R Backward speed = 0
 }
 
 void backwardR1(){
-ledcWrite(pwmPinRB, 75); // Motor R Backward speed prev40
+ledcWrite(pwmPinRB, 80); // Motor R Backward speed prev40
 ledcWrite(pwmPinRF, 0); // Motor R Forward speed = 0
 }
 
 void forwardL1(){
-ledcWrite(pwmPinLF, 76); // Motor L Forward speed prev 50
+ledcWrite(pwmPinLF, 85); // Motor L Forward speed prev 50
 ledcWrite(pwmPinLB, 0); // Motor L Backward speed = 0
 }
 
 void backwardL1(){
-ledcWrite(pwmPinLB, 95); // Motor L Backward speed prev 50
+ledcWrite(pwmPinLB, 88); // Motor L Backward speed prev 50
 ledcWrite(pwmPinLF, 0); // Motor L Forward speed = 0
 }
 //Gyro
