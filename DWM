@@ -1,79 +1,108 @@
-import json
-import redis
-import serial
-import sys
 import time
-from art import text2art
+import numpy as np
 
-if len(sys.argv) == 1:
-    print("Please provide a numeric value for the first down")
-    print("Example: python first_down.py 0.18")
-    sys.exit()
+# === Kalmanfilter-konfiguration ===
+kalman_x = {
+    'x': 0.0,
+    'v': 0.0,
+    'P': np.array([[1, 0], [0, 1]], dtype=np.float32)
+}
+kalman_y = {
+    'x': 0.0,
+    'v': 0.0,
+    'P': np.array([[1, 0], [0, 1]], dtype=np.float32)
+}
 
-try:
-    first_down = float(sys.argv[1])
-    print("Initial First Down is at {}".format(first_down))
-except ValueError:
-    print("Please provide a float value for the argument (first down)")
-    print("Example: python first_down.py 0.18")
-    sys.exit()
+def kalman_update(kalman_state, acc, measurement=None, dt=0.1):
+    A = np.array([[1, dt], [0, 1]])
+    B = np.array([[0.5 * dt**2], [dt]])
+    x = np.array([[kalman_state['x']], [kalman_state['v']]])
+    u = np.array([[acc]])
 
-first_down_art = text2art(text="FIRST DOWN!", font="3d-diagonal")
+    Q = np.array([[0.01, 0], [0, 0.01]])
 
-# Connect to Redis on port 7001
-r = redis.Redis(host='localhost', port=7001, db=0)
+    acc_magnitude = abs(acc)
+    if acc_magnitude < 0.1:
+        R = 5.0    # Lita på DWM
+    elif acc_magnitude < 1.0:
+        R = 25.0   # Lita delvis på båda
+    else:
+        R = 100.0  # Lita mer på acc
 
-# Connect to Decawave tag via UART (/dev/ttyAMA0)
-DWM = serial.Serial(port="/dev/ttyAMA0", baudrate=115200)
-print("Connected to " + DWM.name)
+    x_pred = A @ x + B @ u
+    P_pred = A @ kalman_state['P'] @ A.T + Q
 
-# Two carriage returns to initiate communication with Decawave tag
-DWM.write("\r\r".encode())
-print("Encode")
-time.sleep(1)
+    if measurement is not None:
+        H = np.array([[1, 0]])
+        z = np.array([[measurement]])
+        y = z - H @ x_pred
+        S = H @ P_pred @ H.T + R
+        K = P_pred @ H.T @ np.linalg.inv(S)
+        x_new = x_pred + K @ y
+        P_new = (np.eye(2) - K @ H) @ P_pred
+    else:
+        x_new = x_pred
+        P_new = P_pred
 
-# Tell Decawave board to start sending data
-DWM.write("lec\r".encode())
-print("Encode")
-time.sleep(1)
+    kalman_state['x'] = x_new[0, 0]
+    kalman_state['v'] = x_new[1, 0]
+    kalman_state['P'] = P_new
+    return kalman_state['x']
 
-try:
-    while True:
-        data = DWM.readline()
-        if data:
-            print(data)
-            # If the data includes locations for each anchor, parse it
-            if ("DIST".encode() in data and "AN0".encode() in data and "AN1".encode() in data and "AN2".encode() in data):
-                data = data.replace("\r\n".encode(), "".encode())
-                data = data.decode().split(",")
-                if "DIST" in data:
-                    anchor_number = int(data[data.index("DIST") + 1])
-                    for i in range(anchor_number):
-                        pos_AN = {
-                            "id": data[data.index("AN" + str(i)) + 1],
-                            "x": data[data.index("AN" + str(i)) + 2],
-                            "y": data[data.index("AN" + str(i)) + 3],
-                            "z": data[data.index("AN" + str(i)) + 4],
-                            "dist": data[data.index("AN" + str(i)) + 5]
-                        }
-                        pos_AN = json.dumps(pos_AN)
-                        print(pos_AN)
-                        r.set('AN' + str(i), pos_AN)
-            # If there is position data for the tag
-            if "POS" in data:
-                x_pos = data[data.index("POS") + 1]
-                y_pos = data[data.index("POS") + 2]
-                z_pos = data[data.index("POS") + 3]
-                pos = {"x": x_pos, "y": y_pos, "z": z_pos}
-                pos = json.dumps(pos)
-                print(pos)
-                if float(x_pos) > first_down:
-                    print(first_down_art)
-                    first_down += 0.2
-                    print("New first down is at {}".format(first_down))
-                r.set("pos", pos)
-    DWM.write("\r".encode())
-    DWM.close()
+# === Uppdaterad DWM-tråd ===
+def dwm_position_task(client_sock):
+    global x, y
+    try:
+        with serial.Serial("/dev/ttyACM0", 115200, timeout=1) as ser:
+            ser.write(b"\r")
+            time.sleep(0.1)
+            ser.write(b"\r")
+            time.sleep(0.1)
 
-except KeyboardInterrupt:
-    print("Stop")
+            # Vänta på DWM-prompt
+            start = time.time()
+            while time.time() - start < 2:
+                if ser.in_waiting:
+                    line = ser.readline().decode("utf-8").strip()
+                    if "dwm>" in line:
+                        break
+
+            ser.write(b"lep\r")
+            time.sleep(0.2)
+            print("[AGV] DWM-positionering startad.")
+
+            last_time = time.time()
+
+            while True:
+                now = time.time()
+                dt = now - last_time
+                last_time = now
+
+                ax, ay = 0.0, 0.0
+                if esp_serial.in_waiting:
+                    esp_line = esp_serial.readline().decode().strip()
+                    if esp_line.startswith("mpu:"):
+                        try:
+                            parts = esp_line.replace("mpu:", "").split(",")
+                            ax = float(parts[0].split(":")[1])
+                            ay = float(parts[1].split(":")[1])
+                        except Exception as e:
+                            print("[Kalman] Fel vid parsing av MPU:", e)
+                            continue
+
+                line = ser.readline().decode("utf-8").strip()
+                if line.startswith("POS,"):
+                    parts = line.split(",")
+                    if len(parts) >= 3:
+                        raw_x = float(parts[1]) * 100.0
+                        raw_y = float(parts[2]) * 100.0
+
+                        x_filtered = kalman_update(kalman_x, ax, raw_x, dt)
+                        y_filtered = kalman_update(kalman_y, ay, raw_y, dt)
+
+                        x, y = round(x_filtered), round(y_filtered)
+
+                        client_sock.send(f"POS:{x},{y}\r\n".encode("utf-8"))
+                        print(f"[AGV] Kalman POS: {x},{y}")
+    except Exception as e:
+        print("[AGV] DWM-fel:", e)
