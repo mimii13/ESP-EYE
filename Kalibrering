@@ -1,120 +1,293 @@
-import RPi.GPIO as GPIO
-import time
-import math
-import json
-from pathlib import Path
+// Define pin and PWM parameters
+#include <driver/ledc.h> // Include the ESP32 PWM control library
+#include <Wire.h>
+#include <MPU9250_asukiaaa.h>
 
-# ----- GPIO-konfiguration för HM55B -----
-PIN_EN = 17
-PIN_CLK = 27
-PIN_DIN = 23
-PIN_DOUT = 22
+// Gyro acc
+MPU9250_asukiaaa mySensor;
 
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(PIN_EN, GPIO.OUT)
-GPIO.setup(PIN_CLK, GPIO.OUT)
-GPIO.setup(PIN_DIN, GPIO.OUT)
-GPIO.setup(PIN_DOUT, GPIO.IN)
+// Offset för gyro
+float gyroX_offset = 0.0;
+float gyroY_offset = 0.0;
+float gyroZ_offset = 0.0;
 
-# ----- Funktioner för att kommunicera med HM55B -----
-def pulse_clock():
-    GPIO.output(PIN_CLK, True)
-    time.sleep(0.00001)
-    GPIO.output(PIN_CLK, False)
-    time.sleep(0.00001)
+// Motors R
+const int pwmPinRF = 18;
+const int pwmPinRB = 19; // GPIO pin connected to H-bridge input
+const int pwmChannelA = 0;
+const int pwmChannelB = 1; // PWM channel (0-15 available on ESP32)
 
-def shift_out(data, bits=4):
-    for i in range(bits):
-        bit = (data >> (bits - 1 - i)) & 1
-        GPIO.output(PIN_DIN, bit)
-        pulse_clock()
+// Motors L
+const int pwmPinLF = 32;
+const int pwmPinLB = 33; // GPIO pin connected to H-bridge input
+const int pwmChannelC = 2;
+const int pwmChannelD = 3; // PWM channel (0-15 available on ESP32)
 
-def shift_in(bits=4):
-    value = 0
-    for _ in range(bits):
-        pulse_clock()
-        value <<= 1
-        if GPIO.input(PIN_DOUT):
-            value |= 1
-    return value
+// UART
+#define RXD2 16 // ESP32 RX (connect to Pi TX)
+#define TXD2 17 // ESP32 TX (connect to Pi RX)
 
-def reset_compass():
-    GPIO.output(PIN_EN, True)
-    time.sleep(0.001)
-    GPIO.output(PIN_EN, False)
-    shift_out(0b0000)
-    GPIO.output(PIN_EN, True)
+const int pwmFreq = 5000; // Frequency in Hz
+const int pwmResolution = 8; // Resolution in bits (1-16)
+const int dutyCycle = 250; // For 8-bit resolution: 0-255
 
-def start_measurement():
-    GPIO.output(PIN_EN, False)
-    shift_out(0b1000)
-    GPIO.output(PIN_EN, True)
+void setup() {
+Serial.begin(115200); // USB debug
+Serial2.begin(115200, SERIAL_8N1, RXD2, TXD2); // UART2 for Pi
 
-def wait_for_ready():
-    while True:
-        GPIO.output(PIN_EN, False)
-        shift_out(0b1100)
-        status = shift_in(4)
-        GPIO.output(PIN_EN, True)
-        if status == 0b1100:
-            break
-        time.sleep(0.005)
+pinMode(pwmPinRF, OUTPUT);
+pinMode(pwmPinRB, OUTPUT);
+pinMode(pwmPinLF, OUTPUT);
+pinMode(pwmPinLB, OUTPUT);
 
-def read_axes():
-    GPIO.output(PIN_EN, False)
-    shift_out(0b1100)
-    _ = shift_in(4)  # status
-    x = shift_in(11)
-    y = shift_in(11)
-    GPIO.output(PIN_EN, True)
+// Configure PWM channels with `ledcSetup` first
 
-    if x & 0x400: x -= 0x800
-    if y & 0x400: y -= 0x800
-    return x, y
+ledcAttachChannel(pwmPinRF, pwmFreq, pwmResolution, pwmChannelA);
+ledcAttachChannel(pwmPinRB, pwmFreq, pwmResolution, pwmChannelB);
+ledcAttachChannel(pwmPinLF, pwmFreq, pwmResolution, pwmChannelC);
+ledcAttachChannel(pwmPinLB, pwmFreq, pwmResolution, pwmChannelD);
 
-def get_avg_axes(samples=10):
-    xs, ys = [], []
-    for _ in range(samples):
-        reset_compass()
-        start_measurement()
-        wait_for_ready()
-        x, y = read_axes()
-        xs.append(x)
-        ys.append(y)
-        time.sleep(0.02)
-    return sum(xs) / len(xs), sum(ys) / len(ys)
+stop(); // Ensure stopped at startup
 
-# ----- Kalibreringslogik -----
-def calibrate():
-    print("\n  Börjar kalibrering av HM55B")
-    print("  Sätt AGV:n i rätt riktning, tryck [Enter] för varje steg.")
-    directions = ["NORD", "ÖST", "SYD", "VÄST"]
-    measurements = {}
+delay(1000);
+Serial.println("Initierar MPU-9150...");
 
-    for dir in directions:
-        input(f"\n Rikta AGV mot {dir} och tryck [Enter]...")
-        x, y = get_avg_axes()
-        print(f"  {dir}: x = {x:.1f}, y = {y:.1f}")
-        measurements[dir] = {"x": x, "y": y}
+Wire.begin(21, 22); // SDA, SCL för ESP32 Feather
+mySensor.setWire(&Wire);
+mySensor.beginAccel();
+mySensor.beginGyro();
 
-    # Beräkna offset
-    x_offset = (measurements["NORD"]["x"] + measurements["SYD"]["x"]) / 2
-    y_offset = (measurements["ÖST"]["y"] + measurements["VÄST"]["y"]) / 2
+delay(500);
+calibrateGyro(); // ← Kör kalibrering när sensorn ligger stilla
 
-    print("\n Kalibrering klar!")
-    print(f"  x_offset = {x_offset:.2f}")
-    print(f"  y_offset = {y_offset:.2f}")
+Serial.println("ESP32 ready. Waiting for commands...");
+}
 
-    # Spara till fil
-    data = {"x_offset": x_offset, "y_offset": y_offset}
-    with open("compass_calibration.json", "w") as f:
-        json.dump(data, f, indent=2)
-    print("\n💾 Sparade offset-värden i compass_calibration.json")
+void loop() {
+  //motorer
+  if (Serial2.available()) {
+  char received = Serial2.read(); // ✅ FIXED: Read from Serial2
+  Serial.print("Received command: "); // Print to USB monitor
+  Serial.println(received); 
+  //
+  int n = 0;
 
-# ----- Kör kalibreringen -----
-try:
-    calibrate()
-except KeyboardInterrupt:
-    print("\nAvbruten.")
-finally:
-    GPIO.cleanup()
+  if (received == '2'){ // 45 grader
+    n = 1;
+  }
+  else if (received == '3'){ // 90 grader
+    n = 2;
+  }
+  else if (received == '4'){ // 135 grader
+    n = 3;
+  }
+  else if (received == '5'){ // +-180 grader
+    n = 4;
+  }
+  else if (received == '6'){ // -45 grader
+    n = 1;
+  }
+  else if (received == '7'){ // -90 grader
+    n = 2;
+  }
+  else if (received == '8'){ // -135 grader
+    n = 3;
+  }
+
+  switch (received) {
+    case '0':
+      Forward();
+      Serial2.println("ACK: Forward");
+      n = 0;
+      break;
+
+    case '1':
+      Backward();
+      Serial2.println("ACK: Backward");
+      n = 0;
+      break;
+
+    case '2':
+      rotR();
+      delay(2430*n/2);
+      Serial2.println("ACK: Rotate Right with 45 degrees");
+      stop();
+      n = 0;
+      break;
+
+    case '3':
+      rotR();
+      delay(2430*n/2);
+      Serial2.println("ACK: Rotate Right with 90 degrees");
+      stop();
+      n = 0;
+      break;
+
+    case '4':
+      rotR();
+      delay(2430*n/2);
+      Serial2.println("ACK: Rotate Right with 135 degrees");
+      stop();
+      n = 0;
+      break;
+
+    case '5':
+      rotL();
+      delay(2430*n/2);
+      Serial2.println("ACK: Rotate Left with 180 degrees");
+      stop();
+      n = 0;
+      break;
+
+    case '6':
+      rotL();
+      delay(2430*n/2);
+      Serial2.println("ACK: Rotate Left with 45 degrees");
+      stop();
+      n = 0;
+      break;
+
+    case '7':
+      rotL();
+      delay(2430*n/2);
+      Serial2.println("ACK: Rotate Left with 90 degrees");
+      stop();
+      n = 0;
+      break;
+
+    case '8':
+      rotL();
+      delay(2430*n/2);
+      Serial2.println("ACK: Rotate Left with 135 degrees");
+      stop();
+      n = 0;
+      break;
+
+    case '9':
+      stop();
+      Serial2.println("ACK: Stop");
+      n = 0;
+      break;
+
+    default:
+      stop();
+      Serial2.println("ACK: Unknown, Stopped");
+      Serial.print("Unknown command: ");
+      Serial.println(received);
+      break;
+    }
+  }
+  // Accelerometer mm
+  mySensor.accelUpdate();
+  mySensor.gyroUpdate();
+
+  // Accelerometer – du använder bara X och Y
+  float ax = mySensor.accelX();
+  float ay = mySensor.accelY();
+
+  // Korrigerade gyrovärden
+  float gx = mySensor.gyroX() - gyroX_offset;
+  float gy = mySensor.gyroY() - gyroY_offset;
+  float gz = mySensor.gyroZ() - gyroZ_offset;
+
+  Serial1.print("mpu: ");
+  Serial1.print(ax); Serial1.print(", ");
+  Serial1.print(ay); Serial1.print(", ");
+  Serial1.print(gx); Serial1.print(", ");
+  Serial1.println(gy); // Skriv ut på en ny rad
+
+}
+
+// === Movement functions ===
+
+void Forward(){
+forwardR();
+forwardL();
+}
+
+void Backward(){
+backwardR();
+backwardL();
+}
+
+void rotR(){
+backwardR1();
+forwardL1();
+}
+
+void rotL(){
+forwardR1();
+backwardL1();
+}
+
+void stop(){
+ledcWrite(pwmPinRF, 0); // Stop motor by writing 0 to the PWM channel
+ledcWrite(pwmPinRB, 0);
+ledcWrite(pwmPinLF, 0);
+ledcWrite(pwmPinLB, 0);
+}
+
+
+void forwardR(){
+ledcWrite(pwmPinRF, 148); // Motor R Forward speed prev 120
+ledcWrite(pwmPinRB, 0); // Motor R Backward speed = 0
+}
+
+void backwardR(){
+ledcWrite(pwmPinRB, 147); // Motor R Backward speed
+ledcWrite(pwmPinRF, 0); // Motor R Forward speed = 0
+}
+
+void forwardL(){
+ledcWrite(pwmPinLF, 151); // Motor L Forward speed
+ledcWrite(pwmPinLB, 0); // Motor L Backward speed = 0
+}
+
+void backwardL(){
+ledcWrite(pwmPinLB, 146); // Motor L Backward speed
+ledcWrite(pwmPinLF, 0); // Motor L Forward speed = 0
+}
+
+void forwardR1(){
+ledcWrite(pwmPinRF, 65); // Motor R Forward speed prev 40
+ledcWrite(pwmPinRB, 0); // Motor R Backward speed = 0
+}
+
+void backwardR1(){
+ledcWrite(pwmPinRB, 75); // Motor R Backward speed prev40
+ledcWrite(pwmPinRF, 0); // Motor R Forward speed = 0
+}
+
+void forwardL1(){
+ledcWrite(pwmPinLF, 76); // Motor L Forward speed prev 50
+ledcWrite(pwmPinLB, 0); // Motor L Backward speed = 0
+}
+
+void backwardL1(){
+ledcWrite(pwmPinLB, 95); // Motor L Backward speed prev 50
+ledcWrite(pwmPinLF, 0); // Motor L Forward speed = 0
+}
+//Gyro
+void calibrateGyro() {
+  Serial.println("Kalibrerar gyro... håll sensorn helt stilla!");
+  float gx = 0.0, gy = 0.0, gz = 0.0;
+  const int samples = 100;
+
+  for (int i = 0; i < samples; i++) {
+    mySensor.gyroUpdate();
+    gx += mySensor.gyroX();
+    gy += mySensor.gyroY();
+    gz += mySensor.gyroZ();
+    delay(10);
+  }
+
+  gyroX_offset = gx / samples;
+  gyroY_offset = gy / samples;
+  gyroZ_offset = gz / samples;
+
+  Serial.println("Gyro-kalibrering klar!");
+  Serial.print("Offset X: "); Serial.println(gyroX_offset);
+  Serial.print("Offset Y: "); Serial.println(gyroY_offset);
+  Serial.print("Offset Z: "); Serial.println(gyroZ_offset);
+}
+
