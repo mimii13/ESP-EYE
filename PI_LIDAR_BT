@@ -1,0 +1,175 @@
+# AGV Raspberry Pi-huvudkod:
+# - Bluetooth-server för överordnat system (t.ex. mobil/dator)
+# - Tar emot och skickar mål till ESP32
+# - Tar emot och visar position från ESP32
+# - Startar Lidar-task på kommando, skickar Lidar-data till klient
+# - All logik och trådning är kommenterad
+
+import bluetooth  # För Bluetooth RFCOMM-server
+import time
+import serial     # För UART (ESP32)
+import struct     # För tolkning av Lidar-paket
+import threading  # För att lyssna på position och köra Lidar parallellt
+from collections import deque
+
+# -- AGV-position, mutex för trådning --
+position_lock = threading.Lock()
+x, y = 475.0, 190.0  # Startvärde, kan ändras
+lidar_active = False
+LIDAR_PORT = "/dev/ttyUSB0"     # RPLidar C1 device
+LIDAR_BAUDRATE = 460800         # Lidar baudrate
+CMD_STOP = b'\xA5\x25'
+CMD_SCAN = b'\xA5\x20'
+check_angles = [i for i in range(0, 360, 1)]  # 0-359 grader, 1 grad steg
+
+# -- Seriell anslutning till ESP32 --
+esp_serial = serial.Serial('/dev/ttyS0', 115200, timeout=1)
+
+def update_position(new_x, new_y):
+    """Säker trådad uppdatering av position."""
+    global x, y
+    with position_lock:
+        x, y = new_x, new_y
+
+def get_position():
+    """Hämta aktuell position, trådsäkert."""
+    global x, y
+    with position_lock:
+        return x, y
+
+def parse_packet(packet):
+    """Tolka 5-byte Lidar-paket till (vinkel, avstånd, kvalitet)."""
+    if len(packet) != 5:
+        return None
+    b0, b1, b2, b3, b4 = struct.unpack('<BBBBB', packet)
+    start_flag = b0 & 0x01
+    inverted_start_flag = (b0 >> 1) & 0x01
+    if start_flag != (~inverted_start_flag & 0x01):
+        return None
+    quality = b0 >> 2
+    angle_q6 = ((b2 << 7) | (b1 >> 1))
+    angle = (angle_q6 / 64.0) % 360
+    dist_q2 = (b4 << 8) | b3
+    distance_cm = round((dist_q2 / 4.0) / 10.0)
+    return angle, max(0, distance_cm), quality
+
+def get_descriptor(ser):
+    """Synkar Lidar-dataflödet, kräver 7 bytes header."""
+    descriptor = ser.read(7)
+    if descriptor[:2] != b'\xA5\x5A':
+        raise Exception("Misslyckades med att ta emot scan descriptor")
+
+def lidar_task(client_sock):
+    """Lidar-task: läser ett varv, skickar LIDAR:... till Bluetooth-klient."""
+    global lidar_active
+    lidar_active = True
+    try:
+        with serial.Serial(LIDAR_PORT, LIDAR_BAUDRATE, timeout=1) as ser:
+            ser.write(CMD_STOP)
+            time.sleep(0.1)
+            ser.reset_input_buffer()
+            ser.write(CMD_SCAN)
+            get_descriptor(ser)
+            temp_array = [0] * len(check_angles)
+            current_index = 0
+            while lidar_active:
+                packet = ser.read(5)
+                if len(packet) != 5:
+                    continue
+                result = parse_packet(packet)
+                if result is None:
+                    continue
+                angle, distance_cm, _ = result
+                angle_rounded = round(angle)
+                target_angle = check_angles[current_index]
+                if abs(angle_rounded - target_angle) <= 1:
+                    temp_array[current_index] = round(distance_cm, 1)
+                    current_index += 1
+                    if current_index >= len(check_angles):
+                        current_index = 0
+                        lidar_string = "LIDAR:" + ",".join(map(str, temp_array))
+                        try:
+                            client_sock.send((lidar_string + "\n").encode("utf-8"))
+                        except Exception as e:
+                            print("[AGV] LIDAR send error:", e)
+    except Exception as e:
+        print("[AGV] LIDAR-fel:", e)
+    finally:
+        try:
+            ser.write(CMD_STOP)
+            time.sleep(0.1)
+        except:
+            pass
+
+def send_target(x, y):
+    """Skicka målkoordinat till ESP32 via UART."""
+    cmd = f"GO,{x},{y}\n"
+    esp_serial.write(cmd.encode())
+
+def stop_agv():
+    """Skicka STOP till ESP32."""
+    esp_serial.write(b"STOP\n")
+
+def listen_position():
+    """Tråd: lyssnar på ESP32, skriver ut och uppdaterar position."""
+    while True:
+        try:
+            line = esp_serial.readline().decode().strip()
+            if line.startswith("POS,"):
+                parts = line.split(",")
+                if len(parts) >= 3:
+                    try:
+                        px = float(parts[1])
+                        py = float(parts[2])
+                        update_position(px, py)
+                        print(f"[AGV] Position: x={px}, y={py}")
+                    except Exception as e:
+                        print("[AGV] Position parse error:", e)
+            elif "REACHED" in line:
+                print("[AGV] Target reached!")
+        except Exception as e:
+            print("[AGV] Serial error:", e)
+            break
+
+def main():
+    """Huvudfunktion: startar Bluetooth-server, hanterar klienter och kommandon."""
+    server_sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+    server_sock.bind(("", bluetooth.PORT_ANY))
+    server_sock.listen(1)
+    port = server_sock.getsockname()[1]
+    print(f"[AGV] Bluetooth-server på port {port}.")
+
+    # Tråd för att alltid lyssna på position från ESP32
+    threading.Thread(target=listen_position, daemon=True).start()
+
+    try:
+        while True:
+            client_sock, client_info = server_sock.accept()
+            print(f"[AGV] Klient ansluten: {client_info}")
+            try:
+                while True:
+                    data = client_sock.recv(1024).decode("utf-8").strip()
+                    if not data:
+                        break
+                    # Hantera målkommando
+                    if data.startswith("GT,"):
+                        parts = data.replace("GT,", "").split(",")
+                        if len(parts) >= 2:
+                            target_x, target_y = parts[:2]
+                            send_target(target_x, target_y)
+                    elif data == "STOP":
+                        stop_agv()
+                    elif data == "lidar":
+                        # Starta lidar-task i en tråd
+                        threading.Thread(target=lidar_task, args=(client_sock,), daemon=True).start()
+            except Exception as e:
+                print(f"[AGV] Klient frånkopplad: {e}")
+            finally:
+                client_sock.close()
+    except KeyboardInterrupt:
+        print("[AGV] Avslutar Bluetooth-server...")
+        server_sock.close()
+        esp_serial.close()
+
+if __name__ == "__main__":
+    main()
