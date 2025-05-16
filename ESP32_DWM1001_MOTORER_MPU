@@ -1,0 +1,286 @@
+/*
+ * AGV ESP32-huvudkod:
+ * - Läser UWB (DWM1001) för absolut position via UART
+ * - Läser IMU (MPU-9150) via I2C, automatisk kalibrering
+ * - Gör sensorfusion (Kalman X/Y)
+ * - Tar emot målkoordinat från Raspberry Pi via UART
+ * - Styr motorer via PWM, anpassar kraft efter batterispänning (ADC)
+ * - Skickar tillbaka aktuella positioner till Raspberry Pi
+ * - Väntar på "GO,x,y" eller "STOP" från Pi
+ */
+
+#include <Wire.h>
+#include <MPU9250_asukiaaa.h>
+#include <HardwareSerial.h>
+#include <SimpleKalmanFilter.h>
+
+// --- PIN- och PWM-inställningar ---
+#define DWM_RX 16     // UART RX för DWM1001 (UWB)
+#define DWM_TX 17     // UART TX för DWM1001 (UWB)
+#define DWM_BAUD 115200
+
+#define RXD2 16       // UART RX från Pi
+#define TXD2 17       // UART TX till Pi
+
+// Motorpinnar
+const int pwmPinRF = 18, pwmPinRB = 19, pwmPinLF = 32, pwmPinLB = 33;
+const int pwmChannelA = 0, pwmChannelB = 1, pwmChannelC = 2, pwmChannelD = 3;
+const int pwmFreq = 5000, pwmResolution = 8;
+
+// --- Batterimätning (ADC) ---
+const int analogBatteryPin = 39; // GPIO39 (A3 på Huzzah32 Feather ESP32)
+const float R1 = 18000.0; // 18 kΩ motstånd
+const float R2 = 6700.0;  // 6.8 kΩ motstånd
+
+// --- Objekt/bibliotek ---
+HardwareSerial DWMSerial(2); // UART2 för UWB
+MPU9250_asukiaaa mySensor;
+
+// --- Kalmanfilter för X/Y (sensorfusion för position) ---
+SimpleKalmanFilter kfX(1, 1, 0.01);
+SimpleKalmanFilter kfY(1, 1, 0.01);
+
+// --- Kalibreringsoffset (uppdateras automatiskt vid start) ---
+float mag_offset[3] = {0,0,0}, mag_scale[3] = {1,1,1};
+float accel_offset[3] = {0,0,0}, gyro_offset[3] = {0,0,0};
+
+// --- Tillståndsvariabler ---
+float posX=0, posY=0, posZ=0; // UWB-position
+float fusedX=0, fusedY=0, fusedZ=0; // Fuserad (Kalman)
+float vx=0, vy=0, vz=0; // Ej fullt implementerat
+float yaw=0, pitch=0, roll=0; // Orientering
+bool targetActive = false; // Om mål är aktivt
+float targetX=0, targetY=0, targetYaw=0;
+float tolerance = 0.10; // Meter, närmålsstopp
+
+unsigned long lastUWB=0, lastIMU=0;
+
+// --- Motor-DutyCycle (anpassas dynamiskt efter batterispänning) ---
+int dutyF = 75;  // Standard duty för framåt (justeras runtime)
+int dutyB = 146; // Standard duty för bakåt (justeras runtime)
+const int baseDutyF = 75; // Basvärde (vid 7.2V)
+const int baseDutyB = 146;
+const float nominalVoltage = 7.2f; // Referensspänning
+
+// --- DWM1001 TLV state machine ---
+enum { WAIT_HEADER, READ_TYPE, READ_LEN, READ_VALUE, READ_CSUM } tlv_state = WAIT_HEADER;
+uint8_t tlv_type, tlv_len, tlv_value[32], tlv_valueIdx, tlv_cs;
+
+// --- Funktion för att mäta och returnera aktuell batterispänning ---
+float measureBatteryVoltage() {
+  int rawADC = analogRead(analogBatteryPin);
+  // ESP32 12-bit ADC: 0-4095, referensspänning ≈ 3.575 V (kan variera)
+  float voltageAtPin = (rawADC / 4095.0) * 3.575;
+  float batteryVoltage = voltageAtPin * (R1 + R2) / R2;
+  return batteryVoltage;
+}
+
+// --- Dynamisk PWM-anpassning beroende på batterispänning ---
+void updateDutyCycles() {
+  float batteryVoltage = measureBatteryVoltage();
+  // Skala PWM så att motoreffekt hålls konstant oavsett batterispänning
+  // Om spänningen sjunker = öka duty; om spänningen är hög = minska duty
+  float voltageRatio = nominalVoltage / batteryVoltage;
+  dutyF = int(baseDutyF * voltageRatio);
+  dutyB = int(baseDutyB * voltageRatio);
+
+  // Begränsa duty-värden så det inte blir för högt/lågt
+  if (dutyF > 255) dutyF = 255;
+  if (dutyB > 255) dutyB = 255;
+  if (dutyF < 0) dutyF = 0;
+  if (dutyB < 0) dutyB = 0;
+}
+
+// --- Motorstyrningsfunktioner ---
+void stop() {
+  ledcWrite(pwmChannelA, 0); ledcWrite(pwmChannelB, 0);
+  ledcWrite(pwmChannelC, 0); ledcWrite(pwmChannelD, 0);
+}
+void forward() {
+  ledcWrite(pwmChannelA, dutyF); ledcWrite(pwmChannelB, 0);
+  ledcWrite(pwmChannelC, dutyF); ledcWrite(pwmChannelD, 0);
+}
+void backward() {
+  ledcWrite(pwmChannelA, 0); ledcWrite(pwmChannelB, dutyB);
+  ledcWrite(pwmChannelC, 0); ledcWrite(pwmChannelD, dutyB);
+}
+void rotateLeft() {
+  ledcWrite(pwmChannelA, dutyF); ledcWrite(pwmChannelB, 0);
+  ledcWrite(pwmChannelC, 0); ledcWrite(pwmChannelD, dutyB);
+}
+void rotateRight() {
+  ledcWrite(pwmChannelA, 0); ledcWrite(pwmChannelB, dutyB);
+  ledcWrite(pwmChannelC, dutyF); ledcWrite(pwmChannelD, 0);
+}
+
+// --- Automatisk kalibrering av IMU vid start ---
+void calibrateGyro() {
+  float gx = 0.0, gy = 0.0, gz = 0.0;
+  const int samples = 100;
+  for (int i = 0; i < samples; i++) {
+    mySensor.gyroUpdate();
+    gx += mySensor.gyroX();
+    gy += mySensor.gyroY();
+    gz += mySensor.gyroZ();
+    delay(10);
+  }
+  gyro_offset[0] = gx/samples; gyro_offset[1] = gy/samples; gyro_offset[2] = gz/samples;
+}
+void calibrateAccel() {
+  float ax = 0, ay = 0, az = 0;
+  const int samples = 100;
+  for (int i = 0; i < samples; i++) {
+    mySensor.accelUpdate();
+    ax += mySensor.accelX();
+    ay += mySensor.accelY();
+    az += mySensor.accelZ();
+    delay(10);
+  }
+  accel_offset[0] = ax/samples; accel_offset[1] = ay/samples; accel_offset[2] = (az/samples)-1.0;
+}
+
+// --- DWM1001 TLV parsing (avläser position från UWB-modul) ---
+void readDWM1001() {
+  while (DWMSerial.available()) {
+    uint8_t b = DWMSerial.read();
+    switch (tlv_state) {
+      case WAIT_HEADER: if (b==0x0D) tlv_state=READ_TYPE; break;
+      case READ_TYPE: tlv_type=b; tlv_state=READ_LEN; break;
+      case READ_LEN: tlv_len=b; tlv_valueIdx=0; tlv_state=(tlv_len>0)?READ_VALUE:READ_CSUM; break;
+      case READ_VALUE: tlv_value[tlv_valueIdx++]=b; if (tlv_valueIdx==tlv_len) tlv_state=READ_CSUM; break;
+      case READ_CSUM:
+        tlv_cs=b; uint8_t cs=tlv_type^tlv_len; for(int i=0;i<tlv_len;++i) cs^=tlv_value[i];
+        if(tlv_cs==cs && tlv_type==0x41 && tlv_len>=13) {
+          int32_t x = tlv_value[0] | (tlv_value[1]<<8) | (tlv_value[2]<<16) | (tlv_value[3]<<24);
+          int32_t y = tlv_value[4] | (tlv_value[5]<<8) | (tlv_value[6]<<16) | (tlv_value[7]<<24);
+          int32_t z = tlv_value[8] | (tlv_value[9]<<8) | (tlv_value[10]<<16) | (tlv_value[11]<<24);
+          posX = x / 1000.0; posY = y / 1000.0; posZ = z / 1000.0; // Meter
+          lastUWB = millis();
+        }
+        tlv_state=WAIT_HEADER; break;
+    }
+  }
+}
+
+// --- IMU-läsning och orientering (pitch/yaw/roll) ---
+void readIMU(float& ax, float& ay, float& az) {
+  if (mySensor.accelUpdate() == 0 && mySensor.gyroUpdate() == 0 && mySensor.magUpdate() == 0) {
+    ax = (mySensor.accelX()-accel_offset[0]) * 9.80665;
+    ay = (mySensor.accelY()-accel_offset[1]) * 9.80665;
+    az = (mySensor.accelZ()-accel_offset[2]) * 9.80665;
+    mySensor.computeEulerAngles();
+    yaw = mySensor.yaw; pitch = mySensor.pitch; roll = mySensor.roll;
+  }
+}
+
+// --- Rörelselogik: kör mot mål, stoppa när vi är nära nog ---
+void handleMotion() {
+  if (!targetActive) { stop(); return; }
+  float dx = targetX - fusedX;
+  float dy = targetY - fusedY;
+  float dist = sqrt(dx*dx + dy*dy);
+
+  if (dist < tolerance) {
+    stop();
+    targetActive = false;
+    Serial2.println("REACHED");
+    return;
+  }
+  // Enkel proportionalreglering (kan förbättras!)
+  if (dx > 0.05) forward();
+  else if (dx < -0.05) backward();
+  // Lägg till vinkelreglering vid behov (rotateLeft/Right)
+}
+
+void setup() {
+  Serial.begin(115200); // USB debug
+  Serial2.begin(115200, SERIAL_8N1, RXD2, TXD2); // UART till/från Pi
+
+  // --- ADC för batterimätning ---
+  analogReadResolution(12); // 12 bitar
+
+  // --- PWM-setup ---
+  ledcAttachPin(pwmPinRF, pwmChannelA); ledcSetup(pwmChannelA, pwmFreq, pwmResolution);
+  ledcAttachPin(pwmPinRB, pwmChannelB); ledcSetup(pwmChannelB, pwmFreq, pwmResolution);
+  ledcAttachPin(pwmPinLF, pwmChannelC); ledcSetup(pwmChannelC, pwmFreq, pwmResolution);
+  ledcAttachPin(pwmPinLB, pwmChannelD); ledcSetup(pwmChannelD, pwmFreq, pwmResolution);
+
+  stop();
+  delay(500);
+
+  Wire.begin(21, 22);
+  mySensor.setWire(&Wire);
+  mySensor.beginAccel(); mySensor.beginGyro(); mySensor.beginMag();
+
+  calibrateGyro();   // Automatisk gyro-kalibrering
+  calibrateAccel();  // Automatisk accelerometer-kalibrering
+
+  // --- DWM1001 (UWB) init ---
+  DWMSerial.begin(DWM_BAUD, SERIAL_8N1, DWM_RX, DWM_TX);
+  delay(500);
+  // Sätt update rate, prenumerera på position
+  uint8_t setRate[] = {0x00, 0x64, 0x00, 0x64};
+  DWMSerial.write(0x0D); DWMSerial.write(0x0A); DWMSerial.write(4);
+  for (int i=0;i<4;++i) DWMSerial.write(setRate[i]);
+  DWMSerial.write(0x0A^4^setRate[0]^setRate[1]^setRate[2]^setRate[3]);
+  delay(100);
+  uint8_t subscribe[] = {0x02, 0x00, 0x64};
+  DWMSerial.write(0x0D); DWMSerial.write(0x14); DWMSerial.write(3);
+  for (int i=0;i<3;++i) DWMSerial.write(subscribe[i]);
+  DWMSerial.write(0x14^3^subscribe[0]^subscribe[1]^subscribe[2]);
+  delay(100);
+  uint8_t filterOff[] = {0x00};
+  DWMSerial.write(0x0D); DWMSerial.write(0x43); DWMSerial.write(1); DWMSerial.write(0x00); DWMSerial.write(0x43^1^0x00);
+
+  Serial.println("ESP32 READY");
+}
+
+void loop() {
+  // --- Batterimätning och PWM-anpassning ---
+  updateDutyCycles();
+
+  // --- UWB-läsning ---
+  readDWM1001();
+
+  // --- IMU-läsning ---
+  static unsigned long lastImuUpdate = 0;
+  float ax=0, ay=0, az=0;
+  unsigned long now = millis();
+  if (now - lastImuUpdate >= 20) {
+    float dt = (now-lastImuUpdate)/1000.0;
+    lastImuUpdate = now;
+    readIMU(ax, ay, az);
+    // Dead reckoning kan läggas till här vid behov
+  }
+
+  // --- Sensorfusion (Kalman) när ny UWB ---
+  static unsigned long lastKalman = 0;
+  if (lastUWB > lastKalman) {
+    lastKalman = lastUWB;
+    fusedX = kfX.updateEstimate(posX);
+    fusedY = kfY.updateEstimate(posY);
+    vx = vy = 0; // Nollställ dead reckoning
+    // Skicka aktuell position tillbaka till Pi
+    Serial2.print("POS,"); Serial2.print(fusedX,2); Serial2.print(","); Serial2.println(fusedY,2);
+  }
+
+  // --- Ta emot nya mål från Pi ---
+  if (Serial2.available()) {
+    String cmd = Serial2.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.startsWith("GO,")) {
+      int idx1 = cmd.indexOf(','); int idx2 = cmd.indexOf(',', idx1+1);
+      if(idx1>0 && idx2>idx1){
+        targetX = cmd.substring(idx1+1, idx2).toFloat();
+        targetY = cmd.substring(idx2+1).toFloat();
+        targetActive = true;
+        Serial.println("New target set!");
+      }
+    } else if (cmd=="STOP") {
+      stop(); targetActive=false;
+    }
+  }
+
+  // --- Kör mot mål om aktivt ---
+  handleMotion();
+}
