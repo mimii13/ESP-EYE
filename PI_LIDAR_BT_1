@@ -1,0 +1,301 @@
+# AGV Raspberry Pi-huvudkod (Version 3):
+# - Lidar-kod (task, parsing, etc.) återställd till ursprunglig version.
+# - Bluetooth-server för överordnat system
+# - Tar emot och skickar mål till ESP32
+# - Tar emot och visar position från ESP32
+
+import bluetooth
+import time
+import serial
+import struct # Återställd för ursprunglig parse_packet
+import threading
+# from collections import deque # Var inte använd i originalet heller
+
+# -- AGV-position, mutex för trådning --
+position_lock = threading.Lock()
+current_x, current_y = 0.0, 0.0 # Uppdateras från ESP32
+# Original startvärden (om du vill ha dem, men de skrivs över av ESP32):
+# current_x, current_y = 475.0, 190.0
+
+
+# -- Lidar-inställningar och hantering (ÅTERSTÄLLDA TILL ORIGINAL) --
+lidar_active = False # Global flagga som används av den ursprungliga lidar_task
+LIDAR_PORT = "/dev/ttyUSB0"
+LIDAR_BAUDRATE = 460800 # Original baudrate
+CMD_STOP = b'\xA5\x25' # Original Lidar stop command
+CMD_SCAN = b'\xA5\x20' # Original Lidar scan command
+check_angles = [i for i in range(0, 360, 1)] # Original
+
+lidar_thread = None # Behålls för yttre hantering
+# lidar_stop_event kan tas bort om lidar_task enbart styrs av globala lidar_active
+# Men för att main-tråden ska kunna signalera stopp på ett tydligare sätt kan den vara kvar
+# och sätta lidar_active = False.
+lidar_stop_event = None # Används för att signalera från main till lidar_task att lidar_active ska bli False
+
+# -- Seriell anslutning till ESP32 --
+ESP32_SERIAL_PORT = '/dev/ttyAMA0'
+ESP32_BAUDRATE = 115200
+esp_serial = None
+
+try:
+    esp_serial = serial.Serial(ESP32_SERIAL_PORT, ESP32_BAUDRATE, timeout=1)
+    print(f"[AGV] Ansluten till ESP32 på {ESP32_SERIAL_PORT}")
+except serial.SerialException as e:
+    print(f"[AGV] FEL: Kunde inte öppna seriell port till ESP32: {e}")
+    esp_serial = None
+
+def update_position(new_x, new_y):
+    global current_x, current_y
+    with position_lock:
+        current_x, current_y = new_x, new_y
+
+def get_position():
+    global current_x, current_y
+    with position_lock:
+        return current_x, current_y
+
+# Återställd parse_packet funktion från din originalkod
+def parse_packet(packet): # Notera att argumentet heter 'packet' här
+    """Tolka 5-byte Lidar-paket till (vinkel, avstånd, kvalitet)."""
+    if len(packet) != 5:
+        return None
+    b0, b1, b2, b3, b4 = struct.unpack('<BBBBB', packet)
+    start_flag = b0 & 0x01
+    inverted_start_flag = (b0 >> 1) & 0x01
+    if start_flag != (~inverted_start_flag & 0x01): # Original logik
+        return None
+    quality = b0 >> 2
+    angle_q6 = ((b2 << 7) | (b1 >> 1))
+    angle = (angle_q6 / 64.0) % 360
+    dist_q2 = (b4 << 8) | b3
+    distance_cm = round((dist_q2 / 4.0) / 10.0) # Original beräkning
+    return angle, max(0, distance_cm), quality
+
+# Återställd get_descriptor funktion från din originalkod
+def get_descriptor(ser_conn): # Argumentet hette 'ser' i originalet
+    """Synkar Lidar-dataflödet, kräver 7 bytes header."""
+    descriptor = ser_conn.read(7)
+    if descriptor[:2] != b'\xA5\x5A': # Original kontroll
+        raise Exception("Misslyckades med att ta emot scan descriptor")
+    # print(f"[LIDAR Original] Mottog descriptor: {descriptor.hex()}") # Debug
+
+# Återställd lidar_task funktion från din originalkod
+def lidar_task(client_sock_ref): # Argumentet hette 'client_sock' i originalet
+    """Lidar-task: läser ett varv, skickar LIDAR:... till Bluetooth-klient."""
+    global lidar_active # Använder global lidar_active
+    # lidar_active sätts till True av anroparen (main-tråden) innan denna tråd startas.
+    # Eller så kan den sättas här, som i originalet:
+    # lidar_active = True # Detta var i originalkoden
+
+    print("[LIDAR Original] Lidar-tråd startad.")
+    ser_lidar = None # Lokal variabel för seriell port i denna task
+    try:
+        # Öppna Lidar-porten här, som i originalet
+        with serial.Serial(LIDAR_PORT, LIDAR_BAUDRATE, timeout=1) as ser_lidar:
+            print(f"[LIDAR Original] Ansluten till Lidar på {LIDAR_PORT}")
+            ser_lidar.write(CMD_STOP) # Original: Stoppa först
+            time.sleep(0.1)
+            ser_lidar.reset_input_buffer()
+            ser_lidar.write(CMD_SCAN) # Original: Starta scan
+            get_descriptor(ser_lidar) # Original: Hämta descriptor
+
+            temp_array = [0] * len(check_angles) # Original
+            current_index = 0 # Original
+
+            while lidar_active: # Loopar så länge globala lidar_active är True
+                packet_data = ser_lidar.read(5) # Original: läs 5 bytes
+                if not lidar_active: break # Dubbelkolla om vi ska avsluta
+
+                if len(packet_data) != 5:
+                    continue
+                result = parse_packet(packet_data) # Använd original parse_packet
+                if result is None:
+                    continue
+                
+                angle, distance_cm, _ = result # Original: _ för quality
+                angle_rounded = round(angle) # Original
+                
+                # Original logik för att fylla temp_array
+                target_angle = check_angles[current_index]
+                if abs(angle_rounded - target_angle) <= 1: # Original tolerans
+                    temp_array[current_index] = round(distance_cm, 1) # Original avrundning
+                    current_index += 1
+                    if current_index >= len(check_angles):
+                        current_index = 0 # Nollställ för nästa varv
+                        lidar_string = "LIDAR:" + ",".join(map(str, temp_array))
+                        try:
+                            if client_sock_ref and client_sock_ref.fileno() != -1:
+                                client_sock_ref.send((lidar_string + "\n").encode("utf-8"))
+                            else: # Om klienten är borta, sluta skicka och eventuellt avsluta Lidar
+                                print("[LIDAR Original] Bluetooth-klient inte ansluten, avbryter sändning.")
+                                lidar_active = False # Signalera att denna task ska sluta
+                                break 
+                        except Exception as e: # Bredare exception som i originalet
+                            print(f"[LIDAR Original] LIDAR send error: {e}")
+                            lidar_active = False # Signalera att denna task ska sluta
+                            break
+            # Slutet av while lidar_active loopen
+            print("[LIDAR Original] Loopen avslutad, lidar_active är False eller fel uppstod.")
+
+    except Exception as e: # Bredare exception som i originalet
+        print(f"[LIDAR Original] LIDAR-fel: {e}")
+    finally:
+        if ser_lidar and ser_lidar.is_open: # Om ser_lidar definierades och är öppen
+            print("[LIDAR Original] Stoppar Lidar-scan (finally block).")
+            ser_lidar.write(CMD_STOP) # Skicka stoppkommando
+            time.sleep(0.1)
+            ser_lidar.close()
+        # lidar_active sätts till False av den som vill stoppa tråden (main)
+        # eller om ett fel inträffar inuti tråden.
+        print("[LIDAR Original] Lidar-tråd avslutad (finally block).")
+
+
+def send_target_to_esp32(x_coord, y_coord):
+    if esp_serial and esp_serial.is_open:
+        cmd = f"GO,{x_coord},{y_coord}\n"
+        esp_serial.write(cmd.encode())
+        print(f"[AGV] Skickade mål till ESP32: X={x_coord}, Y={y_coord}")
+    else:
+        print("[AGV] Kan inte skicka mål: ESP32 är inte ansluten.")
+
+def stop_agv_esp32():
+    if esp_serial and esp_serial.is_open:
+        esp_serial.write(b"STOP\n")
+        print("[AGV] Skickade STOP till ESP32.")
+    else:
+        print("[AGV] Kan inte skicka STOP: ESP32 är inte ansluten.")
+
+def listen_for_esp32_position():
+    print("[ESP32 Listener] Startad.")
+    while True:
+        if not (esp_serial and esp_serial.is_open):
+            time.sleep(5)
+            continue
+        try:
+            line = esp_serial.readline().decode("utf-8", errors='ignore').strip()
+            if line:
+                if line.startswith("POS,"):
+                    parts = line.split(",")
+                    if len(parts) >= 3:
+                        try:
+                            px = float(parts[1]); py = float(parts[2])
+                            update_position(px, py)
+                        except ValueError:
+                            print(f"[AGV] Fel vid tolkning av position från ESP32: {line}")
+                elif "REACHED" in line:
+                    print("[AGV] ESP32 rapporterar: Mål uppnått!")
+        except serial.SerialException as e:
+            print(f"[ESP32 Listener] Seriell fel: {e}.")
+            if esp_serial: esp_serial.close()
+            time.sleep(5)
+        except Exception as e:
+            print(f"[ESP32 Listener] Oväntat fel: {e}")
+            time.sleep(1)
+
+def main():
+    global lidar_thread, lidar_active # lidar_stop_event tas bort då lidar_task styrs av globala lidar_active
+
+    if not esp_serial:
+        print("[AGV] Avslutar eftersom ESP32-anslutning misslyckades vid start.")
+        return
+
+    server_sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+    server_sock.bind(("", bluetooth.PORT_ANY))
+    server_sock.listen(1)
+    port = server_sock.getsockname()[1]
+    print(f"[BT Server] Bluetooth-server startad på RFCOMM port {port}.")
+
+    esp32_listener_thread = threading.Thread(target=listen_for_esp32_position, daemon=True)
+    esp32_listener_thread.start()
+
+    try:
+        while True:
+            print("[BT Server] Väntar på klientanslutning...")
+            client_sock, client_info = server_sock.accept()
+            print(f"[BT Server] Klient ansluten: {client_info}")
+            current_client_lidar_active = False # För att spåra om denna klient startat lidar
+
+            try:
+                while True:
+                    data_bytes = client_sock.recv(1024)
+                    if not data_bytes:
+                        print("[BT Server] Klient frånkopplad (inga data).")
+                        break
+                    data = data_bytes.decode("utf-8").strip()
+                    print(f"[BT Server] Mottaget från klient {client_info}: {data}")
+
+                    if data.startswith("GT,"):
+                        parts = data.replace("GT,", "").split(",")
+                        if len(parts) >= 2:
+                            try:
+                                target_x = float(parts[0]); target_y = float(parts[1])
+                                send_target_to_esp32(target_x, target_y)
+                                client_sock.send("CMD:GT OK\n".encode("utf-8"))
+                            except ValueError: client_sock.send("CMD:GT ERROR - Bad format\n".encode("utf-8"))
+                        else: client_sock.send("CMD:GT ERROR - Missing params\n".encode("utf-8"))
+                    
+                    elif data == "STOP_AGV":
+                        stop_agv_esp32()
+                        client_sock.send("CMD:STOP_AGV OK\n".encode("utf-8"))
+                    
+                    elif data == "GET_POS":
+                        px, py = get_position()
+                        client_sock.send(f"POS:{px:.2f},{py:.2f}\n".encode("utf-8"))
+
+                    elif data == "lidar": # Originalkommando för att starta lidar
+                        if lidar_thread is not None and lidar_thread.is_alive():
+                            print("[BT Server] Lidar-tråd körs redan. Stoppar befintlig först.")
+                            lidar_active = False # Signalera gamla tråden att stoppa
+                            lidar_thread.join(timeout=2.0)
+                            if lidar_thread.is_alive():
+                                print("[BT Server] VARNING: Föregående Lidar-tråd avslutades inte korrekt.")
+                        
+                        print("[BT Server] Startar ny Lidar-tråd (originalstil).")
+                        lidar_active = True # Sätt globala flaggan för den nya tråden
+                        current_client_lidar_active = True
+                        # Notera: client_sock skickas med, precis som i originalet
+                        lidar_thread = threading.Thread(target=lidar_task, args=(client_sock,), daemon=True)
+                        lidar_thread.start()
+                        client_sock.send("CMD:lidar (start) OK\n".encode("utf-8"))
+
+                    elif data == "STOP_LIDAR": # Behåll ett explicit stoppkommando
+                        if lidar_thread is not None and lidar_thread.is_alive():
+                            print("[BT Server] Stoppar Lidar-tråd via STOP_LIDAR.")
+                            lidar_active = False # Signalera tråden att stoppa
+                            current_client_lidar_active = False
+                            lidar_thread.join(timeout=2.0)
+                            if lidar_thread.is_alive():
+                                client_sock.send("CMD:STOP_LIDAR WARN - Timeout\n".encode("utf-8"))
+                            else:
+                                client_sock.send("CMD:STOP_LIDAR OK\n".encode("utf-8"))
+                            lidar_thread = None
+                        else:
+                            client_sock.send("CMD:STOP_LIDAR INFO - Not running\n".encode("utf-8"))
+                    else:
+                        client_sock.send("CMD:UNKNOWN\n".encode("utf-8"))
+
+            except bluetooth.btcommon.BluetoothError as e:
+                print(f"[BT Server] Bluetooth-fel med klient {client_info}: {e}")
+            except Exception as e:
+                print(f"[BT Server] Oväntat fel med klient {client_info}: {e}")
+            finally:
+                print(f"[BT Server] Stänger anslutning till klient {client_info}.")
+                if current_client_lidar_active and lidar_thread is not None and lidar_thread.is_alive():
+                    print("[BT Server] Klient frånkopplad, stoppar även Lidar-tråd som startades av denna klient.")
+                    lidar_active = False
+                    lidar_thread.join(timeout=1.0)
+                client_sock.close()
+                
+    except KeyboardInterrupt: print("[AGV] Avslutar via KeyboardInterrupt...")
+    except Exception as e: print(f"[AGV] Oväntat huvudfel: {e}")
+    finally:
+        print("[AGV] Stänger ner server och portar...")
+        if lidar_thread is not None and lidar_thread.is_alive():
+            lidar_active = False
+            lidar_thread.join(timeout=2.0)
+        if server_sock: server_sock.close()
+        if esp_serial and esp_serial.is_open: esp_serial.close()
+        print("[AGV] Nedstängning klar.")
+
+if __name__ == "__main__":
+    main()
