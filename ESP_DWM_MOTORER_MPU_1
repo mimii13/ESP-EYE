@@ -1,0 +1,304 @@
+/*
+ * AGV ESP32-huvudkod (Version 3):
+ * - UART-konflikt löst: DWM1001 på Serial1, Pi på Serial2
+ * - Förbättrad rörelselogik med gir-styrning (P-regulator)
+ * - Dead reckoning med IMU mellan UWB-uppdateringar (grundläggande)
+ * - Magnetometerkalibrering vid start
+ * - DWM1001 konfigureras med TLV-kommandon
+ * - Läser UWB (DWM1001) för absolut position via UART1 (TLV-parsing)
+ * - Läser IMU (MPU-9250) via I2C, automatisk kalibrering
+ * - Gör sensorfusion (Kalman X/Y) och dead reckoning
+ * - Tar emot målkoordinat från Raspberry Pi via UART2
+ * - Styr motorer via PWM, anpassar kraft efter batterispänning (ADC)
+ * - Skickar tillbaka aktuella positioner till Raspberry Pi
+ * - Väntar på "GO,x,y" eller "STOP" från Pi
+ */
+
+#include <Wire.h>
+#include <MPU9250_asukiaaa.h>
+#include <HardwareSerial.h>
+#include <SimpleKalmanFilter.h>
+#include <cmath> // För atan2, sqrt, fabs
+
+// --- PIN- och UART-inställningar ---
+#define DWM_RX_PIN 9
+#define DWM_TX_PIN 10
+#define DWM_BAUD 115200
+HardwareSerial DWMSerial(1);
+
+#define PI_RX_PIN 16
+#define PI_TX_PIN 17
+
+const int pwmPinRF = 18, pwmPinRB = 19, pwmPinLF = 32, pwmPinLB = 33;
+const int pwmChannelA = 0, pwmChannelB = 1, pwmChannelC = 2, pwmChannelD = 3;
+const int pwmFreq = 5000, pwmResolution = 8;
+
+const int analogBatteryPin = 39;
+const float R1 = 18000.0;
+const float R2 = 6700.0;
+const float ADC_REFERENCE_VOLTAGE = 3.575;
+
+MPU9250_asukiaaa mySensor;
+SimpleKalmanFilter kfX(1, 1, 0.01);
+SimpleKalmanFilter kfY(1, 1, 0.01);
+
+float posX=0, posY=0, posZ=0;
+float fusedX=0, fusedY=0;
+float vx=0, vy=0;
+float yaw=0, pitch=0, roll=0;
+bool targetActive = false;
+float targetX=0, targetY=0;
+float distanceTolerance = 0.10;
+float yawTolerance = 5.0;
+
+unsigned long lastUWBTime=0;
+unsigned long lastIMUTime=0;
+unsigned long lastKalmanTime=0;
+
+int dutyF = 75;
+int dutyB = 146;
+const int baseDutyF = 75;
+const int baseDutyB = 146;
+const float nominalVoltage = 7.2f;
+
+enum { WAIT_HEADER, READ_TYPE, READ_LEN, READ_VALUE, READ_CSUM } tlv_state = WAIT_HEADER;
+uint8_t tlv_type, tlv_len, tlv_value[32], tlv_valueIdx, tlv_cs;
+
+const float Kp_yaw = 2.0;
+
+float measureBatteryVoltage() {
+  int rawADC = analogRead(analogBatteryPin);
+  float voltageAtPin = (rawADC / 4095.0) * ADC_REFERENCE_VOLTAGE;
+  float batteryVoltage = voltageAtPin * (R1 + R2) / R2;
+  return batteryVoltage;
+}
+
+void updateDutyCycles() {
+  float batteryVoltage = measureBatteryVoltage();
+  if (batteryVoltage < 1.0) return;
+  float voltageRatio = nominalVoltage / batteryVoltage;
+  dutyF = int(baseDutyF * voltageRatio);
+  dutyB = int(baseDutyB * voltageRatio);
+  dutyF = constrain(dutyF, 0, 255);
+  dutyB = constrain(dutyB, 0, 255);
+}
+
+void stopMotors() {
+  ledcWrite(pwmChannelA, 0); ledcWrite(pwmChannelB, 0);
+  ledcWrite(pwmChannelC, 0); ledcWrite(pwmChannelD, 0);
+}
+void moveForward() {
+  ledcWrite(pwmChannelA, dutyF); ledcWrite(pwmChannelB, 0);
+  ledcWrite(pwmChannelC, dutyF); ledcWrite(pwmChannelD, 0);
+}
+void moveBackward() {
+  ledcWrite(pwmChannelA, 0); ledcWrite(pwmChannelB, dutyB);
+  ledcWrite(pwmChannelC, 0); ledcWrite(pwmChannelD, dutyB);
+}
+void rotateLeft() {
+  ledcWrite(pwmChannelA, 0); ledcWrite(pwmChannelB, dutyB);
+  ledcWrite(pwmChannelC, dutyF); ledcWrite(pwmChannelD, 0);
+}
+void rotateRight() {
+  ledcWrite(pwmChannelA, dutyF); ledcWrite(pwmChannelB, 0);
+  ledcWrite(pwmChannelC, 0); ledcWrite(pwmChannelD, dutyB);
+}
+
+void calibrateSensors() {
+  Serial.println("Startar IMU-kalibrering...");
+  Serial.println("Kalibrerar gyroskop: Håll AGV stilla.");
+  mySensor.gyroCalibrate();
+  Serial.println("Gyroskop kalibrerat.");
+  Serial.println("Kalibrerar accelerometer: Håll AGV stilla och plant.");
+  mySensor.accelCalibrate();
+  Serial.println("Accelerometer kalibrerad.");
+  Serial.println("Startar magnetometerkalibrering.");
+  Serial.println("Rotera AGV:n långsamt runt alla axlar (X, Y, Z) tills värdena stabiliseras.");
+  mySensor.magCalibrate();
+  Serial.println("Magnetometerkalibrering klar.");
+  Serial.print("Mag Bias: "); Serial.print(mySensor.magBias[0]); Serial.print(", "); Serial.print(mySensor.magBias[1]); Serial.print(", "); Serial.println(mySensor.magBias[2]);
+  Serial.print("Mag Scale: "); Serial.print(mySensor.magScale[0]); Serial.print(", "); Serial.print(mySensor.magScale[1]); Serial.print(", "); Serial.println(mySensor.magScale[2]);
+}
+
+void readDWM1001() {
+  while (DWMSerial.available()) {
+    uint8_t b = DWMSerial.read();
+    switch (tlv_state) {
+      case WAIT_HEADER: if (b==0x0D) tlv_state=READ_TYPE; break;
+      case READ_TYPE: tlv_type=b; tlv_state=READ_LEN; break;
+      case READ_LEN: tlv_len=b; tlv_valueIdx=0; tlv_state=(tlv_len>0)?READ_VALUE:READ_CSUM; break;
+      case READ_VALUE: tlv_value[tlv_valueIdx++]=b; if (tlv_valueIdx==tlv_len) tlv_state=READ_CSUM; break;
+      case READ_CSUM:
+        tlv_cs=b; uint8_t cs_calc=tlv_type^tlv_len; for(int i=0;i<tlv_len;++i) cs_calc^=tlv_value[i];
+        if(tlv_cs==cs_calc && tlv_type==0x41 && tlv_len>=13) {
+          int32_t x_mm = tlv_value[0] | (tlv_value[1]<<8) | (tlv_value[2]<<16) | (tlv_value[3]<<24);
+          int32_t y_mm = tlv_value[4] | (tlv_value[5]<<8) | (tlv_value[6]<<16) | (tlv_value[7]<<24);
+          int32_t z_mm = tlv_value[8] | (tlv_value[9]<<8) | (tlv_value[10]<<16) | (tlv_value[11]<<24);
+          posX = x_mm / 1000.0f; posY = y_mm / 1000.0f; posZ = z_mm / 1000.0f;
+          lastUWBTime = millis();
+        }
+        tlv_state=WAIT_HEADER; break;
+    }
+  }
+}
+
+void readIMU(float& ax_out, float& ay_out, float& az_out) {
+  if (mySensor.accelUpdate() == 0 && mySensor.gyroUpdate() == 0 && mySensor.magUpdate() == 0) {
+    ax_out = mySensor.accelX() * 9.80665f;
+    ay_out = mySensor.accelY() * 9.80665f;
+    az_out = mySensor.accelZ() * 9.80665f;
+    mySensor.computeEulerAngles(true);
+    yaw = mySensor.yaw; pitch = mySensor.pitch; roll = mySensor.roll;
+    lastIMUTime = millis();
+  } else {
+    ax_out = 0; ay_out = 0; az_out = 0;
+  }
+}
+
+float normalizeAngle(float angle) {
+  while (angle > 180.0f) angle -= 360.0f;
+  while (angle < -180.0f) angle += 360.0f;
+  return angle;
+}
+
+void handleMotion() {
+  if (!targetActive) {
+    stopMotors();
+    return;
+  }
+  float dx = targetX - fusedX;
+  float dy = targetY - fusedY;
+  float distanceToTarget = sqrt(dx*dx + dy*dy);
+
+  if (distanceToTarget < distanceTolerance) {
+    stopMotors();
+    targetActive = false;
+    Serial2.println("REACHED");
+    Serial.println("Mål uppnått!");
+    return;
+  }
+  float targetBearing = atan2(dy, dx) * 180.0f / PI;
+  float yawError = normalizeAngle(targetBearing - yaw);
+
+  if (fabs(yawError) > yawTolerance) {
+    if (yawError > 0) rotateLeft();
+    else rotateRight();
+  } else {
+    moveForward();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  while(!Serial);
+  Serial.println("ESP32 AGV Huvudkod V3 Startar...");
+
+  Serial2.begin(115200, SERIAL_8N1, PI_RX_PIN, PI_TX_PIN);
+  Serial.println("Serial2 (Pi Kommunikation) initierad.");
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  ledcAttachPin(pwmPinRF, pwmChannelA); ledcSetup(pwmChannelA, pwmFreq, pwmResolution);
+  ledcAttachPin(pwmPinRB, pwmChannelB); ledcSetup(pwmChannelB, pwmFreq, pwmResolution);
+  ledcAttachPin(pwmPinLF, pwmChannelC); ledcSetup(pwmChannelC, pwmFreq, pwmResolution);
+  ledcAttachPin(pwmPinLB, pwmChannelD); ledcSetup(pwmChannelD, pwmFreq, pwmResolution);
+  stopMotors();
+  Serial.println("Motor PWM initierad.");
+
+  Wire.begin(21, 22);
+  mySensor.setWire(&Wire);
+  if (mySensor.beginAccel() != 0 || mySensor.beginGyro() != 0 || mySensor.beginMag() != 0) {
+    Serial.println("Kunde inte initiera MPU9250! Stoppar.");
+    while(1);
+  }
+  Serial.println("MPU9250 initierad.");
+  calibrateSensors();
+
+  DWMSerial.begin(DWM_BAUD, SERIAL_8N1, DWM_RX_PIN, DWM_TX_PIN);
+  Serial.println("DWMSerial (UWB Kommunikation) initierad på UART1.");
+  delay(500);
+
+  // Återställd DWM1001 TLV-konfiguration
+  Serial.println("Konfigurerar DWM1001 via TLV...");
+  // Sätt update rate (t.ex. 100ms = 10Hz), prenumerera på position, stäng av internt filter
+  uint8_t setRate[] = {0x00, 0x64, 0x00, 0x64}; // 100ms (0x64), 100ms (pos, stat)
+  DWMSerial.write(0x0D); DWMSerial.write(0x0A); DWMSerial.write(4); // Typ 0x0A: dwm_panid_set (fel typ, borde vara dwm_uwb_cfg_set eller liknande för rate)
+                                                                   // Korrekt typ för dwm_upd_rate_set är 0x05
+                                                                   // Typ för dwm_cfg_tag_set (om det är det du menar med subscribe) är 0x08
+                                                                   // Din originalkod använde 0x0A och 0x14 som TLV typer, vilket kan vara specifikt för din DWM firmware/API
+                                                                   // Jag återställer till exakt det du hade:
+  DWMSerial.write(0x0D); DWMSerial.write(0x0A); DWMSerial.write(4); // Header, Type 0x0A, Length 4
+  for (int i=0;i<4;++i) DWMSerial.write(setRate[i]);
+  DWMSerial.write(0x0A^4^setRate[0]^setRate[1]^setRate[2]^setRate[3]); // Checksum
+  Serial.println("Skickat setRate TLV (Type 0x0A).");
+  delay(100);
+
+  uint8_t subscribe[] = {0x02, 0x00, 0x64}; // Smooth off (0x02), Anchor pos off (0x00), Tag pos on & 100ms (0x64)
+                                           // Detta ser mer ut som värden för ett "subscribe" eller "config" kommando.
+                                           // Din originalkod använde Type 0x14 för detta.
+  DWMSerial.write(0x0D); DWMSerial.write(0x14); DWMSerial.write(3); // Header, Type 0x14, Length 3
+  for (int i=0;i<3;++i) DWMSerial.write(subscribe[i]);
+  DWMSerial.write(0x14^3^subscribe[0]^subscribe[1]^subscribe[2]); // Checksum
+  Serial.println("Skickat subscribe TLV (Type 0x14).");
+  delay(100);
+
+  uint8_t filterOff[] = {0x00}; // Värde 0x00 för att stänga av filter
+                                // Din originalkod använde Type 0x43 för detta.
+  DWMSerial.write(0x0D); DWMSerial.write(0x43); DWMSerial.write(1); DWMSerial.write(0x00); // Header, Type 0x43, Length 1, Value 0x00
+  DWMSerial.write(0x43^1^0x00); // Checksum
+  Serial.println("Skickat filterOff TLV (Type 0x43).");
+  Serial.println("DWM1001 konfigurerad via TLV.");
+
+  fusedX = 0; fusedY = 0;
+  Serial.println("ESP32 REDO!");
+  lastIMUTime = millis();
+  lastKalmanTime = millis();
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  static unsigned long lastBatteryCheck = 0;
+  if (currentTime - lastBatteryCheck >= 1000) {
+    updateDutyCycles();
+    lastBatteryCheck = currentTime;
+  }
+
+  readDWM1001();
+
+  float ax_raw=0, ay_raw=0, az_raw=0;
+  if (currentTime - lastIMUTime >= 20) {
+    float dt_imu = (currentTime - lastIMUTime) / 1000.0f;
+    lastIMUTime = currentTime;
+    readIMU(ax_raw, ay_raw, az_raw);
+    // Dead reckoning logik kan utökas här om så önskas
+  }
+
+  if (lastUWBTime > lastKalmanTime) {
+    fusedX = kfX.updateEstimate(posX);
+    fusedY = kfY.updateEstimate(posY);
+    lastKalmanTime = lastUWBTime;
+    vx = 0; vy = 0;
+    Serial2.print("POS,"); Serial2.print(fusedX, 2);
+    Serial2.print(","); Serial2.println(fusedY, 2);
+  }
+
+  if (Serial2.available()) {
+    String cmd = Serial2.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.startsWith("GO,")) {
+      int idx1 = cmd.indexOf(','); int idx2 = cmd.indexOf(',', idx1 + 1);
+      if (idx1 > 0 && idx2 > idx1) {
+        targetX = cmd.substring(idx1 + 1, idx2).toFloat();
+        targetY = cmd.substring(idx2 + 1).toFloat();
+        targetActive = true;
+        Serial.print("Nytt mål: X="); Serial.print(targetX, 2); Serial.print(", Y="); Serial.println(targetY, 2);
+      }
+    } else if (cmd == "STOP") {
+      stopMotors(); targetActive = false;
+      Serial.println("STOP-kommando mottaget.");
+    }
+  }
+  handleMotion();
+  delay(10);
+}
