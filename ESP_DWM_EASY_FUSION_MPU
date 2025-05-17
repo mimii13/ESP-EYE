@@ -1,0 +1,444 @@
+/*
+ * AGV ESP32-huvudkod:
+ * - Läser UWB (DWM1001) för absolut position via UART
+ * - Läser IMU (MPU-9150) via I2C, automatisk kalibrering med NVS-lagring för magnetometer
+ * - Använder IMU för Yaw, Pitch, Roll-orientering
+ * - IMPLEMENTS IMU DEAD RECKONING for higher frequency position updates between UWB fixes
+ * - Fuses IMU dead reckoning with UWB absolute positions (UWB corrects IMU drift)
+ * - Tar emot målkoordinat från Raspberry Pi via UART
+ * - Styr motorer via PWM, anpassar kraft efter batterispänning (ADC)
+ * - Använder Yaw för att orientera sig mot mål innan rörelse
+ * - Skickar tillbaka aktuella positioner till Raspberry Pi
+ * - Väntar på "GO,x,y" eller "STOP" från Pi
+ */
+
+#include <Wire.h>
+#include <MPU9250_asukiaaa.h>
+#include <HardwareSerial.h>
+#include <SimpleKalmanFilter.h>
+#include <Preferences.h>
+#include <math.h> // For M_PI, cos, sin
+
+// --- PIN- och PWM-inställningar ---
+#define DWM_RX 16
+#define DWM_TX 17
+#define DWM_BAUD 115200
+
+// USE THE PINS YOU CHOSE FOR RASPBERRY PI COMMUNICATION (RESOLVING UART CONFLICT)
+#define PI_RX_PIN 25  // Example: ESP32's RX connected to Pi's TX
+#define PI_TX_PIN 26  // Example: ESP32's TX connected to Pi's RX
+
+const int pwmPinRF = 18, pwmPinRB = 19, pwmPinLF = 32, pwmPinLB = 33;
+const int pwmChannelA = 0, pwmChannelB = 1, pwmChannelC = 2, pwmChannelD = 3;
+const int pwmFreq = 5000, pwmResolution = 8;
+
+const int analogBatteryPin = 39;
+const float R1 = 18000.0;
+const float R2 = 6700.0;
+
+HardwareSerial DWMSerial(2);
+MPU9250_asukiaaa mySensor;
+Preferences preferences;
+
+// Kalmanfilter för UWB X/Y (används för att korrigera/smootha UWB-mätningar)
+SimpleKalmanFilter kfX_uwb(1, 1, 0.01); // Measurement uncertainty, Estimation uncertainty, Process noise
+SimpleKalmanFilter kfY_uwb(1, 1, 0.01);
+
+// --- Tillståndsvariabler ---
+float posX_raw_uwb=0, posY_raw_uwb=0, posZ_raw_uwb=0; // Raw UWB-position
+float fusedX=0, fusedY=0; // Slutlig fuserad position (uppdateras av IMU DR och korrigeras av UWB)
+float velX=0, velY=0;     // Estimerad hastighet från IMU (m/s)
+
+float yaw=0, pitch=0, roll=0; // Orientering från IMU (degrees)
+bool targetActive = false;
+float targetX=0, targetY=0;
+float posTolerance = 0.10;
+float angleTolerance = 5.0;
+
+unsigned long lastUWBTime=0; // Timestamp of the last UWB data reception
+unsigned long lastImuProcessTime = 0; // Timestamp for IMU dead reckoning dt calculation
+
+int dutyF = 75;
+int dutyB = 146;
+const int baseDutyF = 75;
+const int baseDutyB = 146;
+const float nominalVoltage = 7.2f;
+
+enum { WAIT_HEADER, READ_TYPE, READ_LEN, READ_VALUE, READ_CSUM } tlv_state = WAIT_HEADER;
+uint8_t tlv_type, tlv_len, tlv_value[32], tlv_valueIdx, tlv_cs;
+
+// --- Utility Functions (measureBatteryVoltage, updateDutyCycles, motor controls) ---
+// These functions remain the same as in your previous complete code
+// ... (paste measureBatteryVoltage, updateDutyCycles, stop, forward, backward, rotateLeft, rotateRight here) ...
+float measureBatteryVoltage() {
+  int rawADC = analogRead(analogBatteryPin);
+  float voltageAtPin = (rawADC / 4095.0) * 3.575;
+  float batteryVoltage = voltageAtPin * (R1 + R2) / R2;
+  return batteryVoltage;
+}
+
+void updateDutyCycles() {
+  float batteryVoltage = measureBatteryVoltage();
+  float voltageRatio = nominalVoltage / batteryVoltage;
+  dutyF = int(baseDutyF * voltageRatio);
+  dutyB = int(baseDutyB * voltageRatio);
+  dutyF = constrain(dutyF, 0, 255);
+  dutyB = constrain(dutyB, 0, 255);
+}
+
+void stop() {
+  ledcWrite(pwmChannelA, 0); ledcWrite(pwmChannelB, 0);
+  ledcWrite(pwmChannelC, 0); ledcWrite(pwmChannelD, 0);
+}
+void forward() {
+  ledcWrite(pwmChannelA, dutyF); ledcWrite(pwmChannelB, 0);
+  ledcWrite(pwmChannelC, dutyF); ledcWrite(pwmChannelD, 0);
+}
+void backward() {
+  ledcWrite(pwmChannelA, 0); ledcWrite(pwmChannelB, dutyB);
+  ledcWrite(pwmChannelC, 0); ledcWrite(pwmChannelD, dutyB);
+}
+void rotateLeft() {
+  ledcWrite(pwmChannelA, 0); ledcWrite(pwmChannelB, dutyB);
+  ledcWrite(pwmChannelC, dutyF); ledcWrite(pwmChannelD, 0);
+}
+void rotateRight() {
+  ledcWrite(pwmChannelA, dutyF); ledcWrite(pwmChannelB, 0);
+  ledcWrite(pwmChannelC, 0); ledcWrite(pwmChannelD, dutyB);
+}
+
+
+// --- IMU Calibration Functions (calibrateGyro, calibrateAccel) ---
+// These functions remain the same
+// ... (paste calibrateGyro, calibrateAccel here) ...
+void calibrateGyro() {
+  Serial.println("Starting Gyro calibration...");
+  float gx_sum = 0.0, gy_sum = 0.0, gz_sum = 0.0;
+  const int samples = 200;
+  for (int i = 0; i < samples; i++) {
+    mySensor.gyroUpdate();
+    gx_sum += mySensor.gyroX();
+    gy_sum += mySensor.gyroY();
+    gz_sum += mySensor.gyroZ();
+    delay(5);
+  }
+  mySensor.setGyroBias(gx_sum / samples, gy_sum / samples, gz_sum / samples);
+  Serial.println("Gyro calibration complete.");
+  Serial.print("Set Gyro Biases: X="); Serial.print(gx_sum / samples);
+  Serial.print(" Y="); Serial.print(gy_sum / samples);
+  Serial.print(" Z="); Serial.println(gz_sum / samples);
+}
+
+void calibrateAccel() {
+  Serial.println("Starting Accelerometer calibration. Keep the robot flat and still.");
+  float ax_sum = 0, ay_sum = 0, az_sum = 0;
+  const int samples = 200;
+  for (int i = 0; i < samples; i++) {
+    mySensor.accelUpdate();
+    ax_sum += mySensor.accelX();
+    ay_sum += mySensor.accelY();
+    az_sum += mySensor.accelZ();
+    delay(5);
+  }
+  float target_gz = 1.0f; // Assuming Z points UP
+  mySensor.setAccelBias(ax_sum / samples, ay_sum / samples, (az_sum / samples) - target_gz);
+  Serial.println("Accelerometer calibration complete.");
+  Serial.print("Set Accel Biases (raw_avg - target): X="); Serial.print(ax_sum / samples);
+  Serial.print(" Y="); Serial.print(ay_sum / samples);
+  Serial.print(" Z_bias="); Serial.println((az_sum / samples) - target_gz);
+}
+
+// --- Magnetometer NVS Functions (saveMagCalibration, loadMagCalibration) ---
+// These functions remain the same
+// ... (paste saveMagCalibration, loadMagCalibration here) ...
+void saveMagCalibration() {
+  preferences.begin("magCal", false);
+  preferences.putFloat("magOffX", mySensor.magXOffset);
+  preferences.putFloat("magOffY", mySensor.magYOffset);
+  preferences.putFloat("magOffZ", mySensor.magZOffset);
+  preferences.putFloat("magScaX", mySensor.magXScale);
+  preferences.putFloat("magScaY", mySensor.magYScale);
+  preferences.putFloat("magScaZ", mySensor.magZScale);
+  preferences.putBool("calDone", true);
+  preferences.end();
+  Serial.println("Magnetometer calibration data saved to NVS.");
+}
+
+bool loadMagCalibration() {
+  preferences.begin("magCal", true);
+  bool success = preferences.getBool("calDone", false);
+  if (success) {
+    float oX = preferences.getFloat("magOffX", 0);
+    float oY = preferences.getFloat("magOffY", 0);
+    float oZ = preferences.getFloat("magOffZ", 0);
+    float sX = preferences.getFloat("magScaX", 1);
+    float sY = preferences.getFloat("magScaY", 1);
+    float sZ = preferences.getFloat("magScaZ", 1);
+    mySensor.setMagCalibration(oX, oY, oZ, sX, sY, sZ);
+    Serial.println("Magnetometer calibration data loaded from NVS.");
+  } else {
+    Serial.println("No magnetometer calibration data found in NVS.");
+  }
+  preferences.end();
+  return success;
+}
+
+
+// --- DWM1001 TLV parsing ---
+// Remains the same, but stores in posX_raw_uwb, posY_raw_uwb
+void readDWM1001() {
+  while (DWMSerial.available()) {
+    uint8_t b = DWMSerial.read();
+    switch (tlv_state) {
+      case WAIT_HEADER: if (b==0x0D) tlv_state=READ_TYPE; break;
+      case READ_TYPE: tlv_type=b; tlv_state=READ_LEN; break;
+      case READ_LEN: tlv_len=b; tlv_valueIdx=0; tlv_state=(tlv_len>0)?READ_VALUE:READ_CSUM; break;
+      case READ_VALUE: tlv_value[tlv_valueIdx++]=b; if (tlv_valueIdx==tlv_len) tlv_state=READ_CSUM; break;
+      case READ_CSUM:
+        tlv_cs=b; uint8_t cs=tlv_type^tlv_len; for(int i=0;i<tlv_len;++i) cs^=tlv_value[i];
+        if(tlv_cs==cs && tlv_type==0x41 && tlv_len>=13) {
+          int32_t x_mm = tlv_value[0] | (tlv_value[1]<<8) | (tlv_value[2]<<16) | (tlv_value[3]<<24);
+          int32_t y_mm = tlv_value[4] | (tlv_value[5]<<8) | (tlv_value[6]<<16) | (tlv_value[7]<<24);
+          int32_t z_mm = tlv_value[8] | (tlv_value[9]<<8) | (tlv_value[10]<<16) | (tlv_value[11]<<24);
+          posX_raw_uwb = x_mm / 1000.0; 
+          posY_raw_uwb = y_mm / 1000.0; 
+          posZ_raw_uwb = z_mm / 1000.0;
+          lastUWBTime = millis(); // Record time of reception
+        }
+        tlv_state=WAIT_HEADER; break;
+    }
+  }
+}
+
+// --- IMU-läsning, orientering, OCH DEAD RECKONING ---
+void processIMU(float dt) {
+  uint8_t accelStatus = mySensor.accelUpdate();
+  uint8_t gyroStatus = mySensor.gyroUpdate();
+  uint8_t magStatus = mySensor.magUpdate();
+
+  if (accelStatus == 0 && gyroStatus == 0 && magStatus == 0) {
+    mySensor.computeEulerAngles(true);
+    yaw = mySensor.yaw;
+    pitch = mySensor.pitch;
+    roll = mySensor.roll;
+
+    // --- Dead Reckoning Part ---
+    // Get calibrated accelerometer data in G's
+    float accX_body = mySensor.accelX(); // Accel in robot's X direction (forward/backward)
+    float accY_body = mySensor.accelY(); // Accel in robot's Y direction (left/right)
+    // float accZ_body = mySensor.accelZ(); // Vertical acceleration (includes gravity)
+
+    // For simplicity, assuming motion is primarily on a flat plane (roll and pitch are small)
+    // Transform body frame accelerations to world frame using yaw
+    // More complex transformations needed if pitch/roll are significant and robot is not flat
+    float yaw_rad = yaw * M_PI / 180.0f;
+    float accX_world = accX_body * cos(yaw_rad) - accY_body * sin(yaw_rad);
+    float accY_world = accX_body * sin(yaw_rad) + accY_body * cos(yaw_rad);
+
+    // Convert G's to m/s^2
+    float g = 9.80665f;
+    accX_world *= g;
+    accY_world *= g;
+    // Note: We are not explicitly removing gravity from Z here because we are primarily
+    // interested in X_world and Y_world for 2D positioning.
+    // If accX_body and accY_body are from an IMU that already compensates for tilt
+    // to give "linear acceleration" (gravity removed), then this step is simpler.
+    // The MPU9250_asukiaaa library's accelX/Y/Z are raw (but bias corrected) G-force readings.
+
+    // Integrate acceleration to get velocity (simple Euler integration)
+    velX += accX_world * dt;
+    velY += accY_world * dt;
+
+    // Integrate velocity to get position (simple Euler integration)
+    fusedX += velX * dt;
+    fusedY += velY * dt;
+
+  } else {
+    Serial.print("IMU Update Error: Accel="); Serial.print(accelStatus);
+    Serial.print(" Gyro="); Serial.print(gyroStatus);
+    Serial.print(" Mag="); Serial.println(magStatus);
+  }
+}
+
+
+// --- Rörelselogik: orientera och kör mot mål ---
+// Remains the same, uses fusedX, fusedY
+// ... (paste handleMotion here) ...
+void handleMotion() {
+  if (!targetActive) {
+    stop();
+    return;
+  }
+  float dx = targetX - fusedX;
+  float dy = targetY - fusedY;
+  float distToTarget = sqrt(dx * dx + dy * dy);
+
+  if (distToTarget < posTolerance) {
+    stop();
+    targetActive = false;
+    Serial2.println("REACHED");
+    Serial.println("Target reached!");
+    return;
+  }
+
+  float targetAngleDegrees = atan2(dy, dx) * 180.0 / M_PI;
+  float angleError = targetAngleDegrees - yaw;
+  while (angleError > 180.0f) angleError -= 360.0f;
+  while (angleError < -180.0f) angleError += 360.0f;
+
+  if (abs(angleError) > angleTolerance) {
+    if (angleError > 0) rotateLeft(); else rotateRight();
+  } else {
+    forward();
+  }
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("ESP32 AGV Starting (Improved Positioning)...");
+
+  Serial2.begin(115200, SERIAL_8N1, PI_RX_PIN, PI_TX_PIN);
+  Serial.print("Serial2 (to Pi) initialized on RX: "); Serial.print(PI_RX_PIN);
+  Serial.print(", TX: "); Serial.println(PI_TX_PIN);
+  
+  analogReadResolution(12);
+
+  ledcAttachPin(pwmPinRF, pwmChannelA); ledcSetup(pwmChannelA, pwmFreq, pwmResolution);
+  ledcAttachPin(pwmPinRB, pwmChannelB); ledcSetup(pwmChannelB, pwmFreq, pwmResolution);
+  ledcAttachPin(pwmPinLF, pwmChannelC); ledcSetup(pwmChannelC, pwmFreq, pwmResolution);
+  ledcAttachPin(pwmPinLB, pwmChannelD); ledcSetup(pwmChannelD, pwmFreq, pwmResolution);
+  stop();
+  delay(500);
+
+  Wire.begin(21, 22);
+  mySensor.setWire(&Wire);
+
+  Serial.println("Initializing Accel/Gyro...");
+  mySensor.beginAccel();
+  mySensor.beginGyro();
+  calibrateGyro();
+  calibrateAccel();
+
+  Serial.println("Initializing Magnetometer...");
+  mySensor.beginMag();
+  if (!loadMagCalibration()) {
+    Serial.println("\nStarting NEW Magnetometer Calibration in 5 seconds...");
+    Serial.println("Ensure motors and other electronics (RPi) are POWERED ON.");
+    Serial.println("Rotate the robot slowly and thoroughly through all orientations.");
+    delay(5000);
+    mySensor.magCalibration();
+    saveMagCalibration();
+  }
+  
+  DWMSerial.begin(DWM_BAUD, SERIAL_8N1, DWM_RX, DWM_TX);
+  Serial.print("DWMSerial (to UWB) initialized on RX: "); Serial.print(DWM_RX);
+  Serial.print(", TX: "); Serial.println(DWM_TX);
+  delay(500);
+  uint8_t setRate[] = {0x00, 0x64, 0x00, 0x64}; // 100ms update rate (10Hz)
+  DWMSerial.write(0x0D); DWMSerial.write(0x0A); DWMSerial.write(4);
+  for (int i=0;i<4;++i) DWMSerial.write(setRate[i]);
+  DWMSerial.write(0x0A^4^setRate[0]^setRate[1]^setRate[2]^setRate[3]);
+  delay(100);
+  uint8_t subscribe[] = {0x02, 0x00, 0x64};
+  DWMSerial.write(0x0D); DWMSerial.write(0x14); DWMSerial.write(3);
+  for (int i=0;i<3;++i) DWMSerial.write(subscribe[i]);
+  DWMSerial.write(0x14^3^subscribe[0]^subscribe[1]^subscribe[2]);
+  delay(100);
+  uint8_t filterOff[] = {0x00};
+  DWMSerial.write(0x0D); DWMSerial.write(0x43); DWMSerial.write(1); DWMSerial.write(0x00); DWMSerial.write(0x43^1^0x00);
+
+  // Initialize fused position with first UWB reading if possible, or 0,0
+  // This requires waiting for a first UWB fix or assuming a starting point.
+  // For simplicity, we'll start fusedX, fusedY at 0,0. UWB will correct it.
+  // A better approach might be to wait for the first UWB fix in setup to initialize fusedX/Y.
+  fusedX = 0.0; // Or try to get an initial UWB fix here
+  fusedY = 0.0;
+  velX = 0.0;
+  velY = 0.0;
+  lastImuProcessTime = micros(); // Use micros for higher precision dt
+
+  Serial.println("ESP32 READY (Improved Positioning)");
+}
+
+void loop() {
+  updateDutyCycles();
+  readDWM1001(); // Checks for new UWB data and updates posX_raw_uwb, posY_raw_uwb, lastUWBTime
+
+  // --- High-frequency IMU processing and Dead Reckoning ---
+  unsigned long currentTime_micros = micros();
+  float dt = (currentTime_micros - lastImuProcessTime) / 1000000.0f; // dt in seconds
+  lastImuProcessTime = currentTime_micros;
+  
+  if (dt > 0) { // Ensure dt is positive
+      processIMU(dt); // Updates yaw, pitch, roll, and integrates accel to update fusedX, fusedY, velX, velY
+  }
+
+
+  // --- UWB Correction (when new UWB data arrives) ---
+  static unsigned long lastUWBProcessTime = 0; 
+  if (lastUWBTime > lastUWBProcessTime) { // New UWB data has been received
+    lastUWBProcessTime = lastUWBTime;
+
+    // Smooth the raw UWB measurement itself
+    float smoothed_uwb_x = kfX_uwb.updateEstimate(posX_raw_uwb);
+    float smoothed_uwb_y = kfY_uwb.updateEstimate(posY_raw_uwb);
+
+    // Use the smoothed UWB reading to correct the dead-reckoned position
+    // This is a simple "strong correction" or reset.
+    // A more advanced EKF would fuse these more elegantly.
+    fusedX = smoothed_uwb_x; // Correct/reset dead-reckoned X with UWB data
+    fusedY = smoothed_uwb_y; // Correct/reset dead-reckoned Y with UWB data
+    
+    // Optionally, reset velocity estimates if UWB is trusted heavily,
+    // or let the IMU continue to estimate velocity based on accelerations.
+    // For now, we don't reset velX, velY, allowing IMU to estimate motion between UWB fixes.
+    // velX = 0; // If UWB implies a stop or if velocity from UWB is available
+    // velY = 0;
+
+    Serial.print("UWB Corrected Pos: X="); Serial.print(fusedX, 2);
+    Serial.print(" Y="); Serial.println(fusedY, 2);
+    
+    // Send current fused position back to Pi
+    Serial2.print("POS,"); Serial2.print(fusedX,2); Serial2.print(","); Serial2.println(fusedY,2);
+  }
+
+
+  // --- Command Processing from Raspberry Pi ---
+  if (Serial2.available()) {
+    String cmd = Serial2.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.startsWith("GO,")) {
+      int idx1 = cmd.indexOf(',');
+      int idx2 = cmd.indexOf(',', idx1 + 1);
+      if (idx1 > 0 && idx2 > idx1) {
+        targetX = cmd.substring(idx1 + 1, idx2).toFloat();
+        targetY = cmd.substring(idx2 + 1).toFloat();
+        targetActive = true;
+        Serial.print("New target set: X="); Serial.print(targetX);
+        Serial.print(", Y="); Serial.println(targetY);
+      }
+    } else if (cmd == "STOP") {
+      stop();
+      targetActive = false;
+      velX = 0; velY = 0; // Stop means velocity is zero
+      Serial.println("STOP command received.");
+    }
+  }
+
+  handleMotion();
+
+  // Periodic debug print
+  static unsigned long lastOrientationPrintTime = 0;
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastOrientationPrintTime >= 200) { // Print 5 times a second
+    lastOrientationPrintTime = currentMillis;
+    Serial.print("Yaw: "); Serial.print(yaw, 1);
+    Serial.print("\tPitch: "); Serial.print(pitch, 1);
+    Serial.print("\tRoll: "); Serial.print(roll, 1);
+    Serial.print("\tFusedPos: X="); Serial.print(fusedX, 2);
+    Serial.print(" Y="); Serial.print(fusedY, 2);
+    Serial.print("\tVel: Vx="); Serial.print(velX, 2);
+    Serial.print(" Vy="); Serial.println(velY, 2);
+  }
+}
