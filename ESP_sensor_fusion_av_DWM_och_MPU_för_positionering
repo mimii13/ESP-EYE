@@ -8,6 +8,14 @@
  * - Tar emot målkoordinat från Raspberry Pi.
  * - Styr motorer, anpassar kraft efter batterispänning.
  * - Skickar tillbaka EKF-estimerad position till Raspberry Pi.
+ *
+ * PIN CONFIGURATION (mimii13 - 2025-05-17 - DWM on GPIO 25/26):
+ * - DWM1001 (UWB) via UART1:
+ *   - ESP32 GPIO 25 (RX from DWM TXO)
+ *   - ESP32 GPIO 26 (TX to DWM RXI)
+ * - Raspberry Pi via UART2 (default pins):
+ *   - ESP32 GPIO 16 (RX from Pi TXD)
+ *   - ESP32 GPIO 17 (TX to Pi RXD)
  */
 
 #include <Wire.h>
@@ -28,42 +36,46 @@ BLA::Matrix<UWB_MEASUREMENT_SIZE, UWB_MEASUREMENT_SIZE> R_uwb; // UWB Measuremen
 BLA::Matrix<STATE_SIZE> x_est; // Estimerad state vector [x, y, vx, vy, yaw]
 
 // --- PIN- och PWM-inställningar ---
-#define DWM_RX 16
-#define DWM_TX 17
+// DWM1001 (UWB) - Använder UART1 med anpassade pinnar
+#define DWM_RX_PIN 25         // ESP32 RX från DWM1001 TXO (UART1 RX)
+#define DWM_TX_PIN 26         // ESP32 TX till DWM1001 RXI (UART1 TX)
 #define DWM_BAUD 115200
 
-#define PI_RX_PIN 25  // ANPASSA DESSA! ESP32 RX från Pi TX
-#define PI_TX_PIN 26  // ANPASSA DESSA! ESP32 TX till Pi RX
+// Raspberry Pi - Använder UART2 med default pinnar
+#define PI_RX_PIN 16          // ESP32 RX från Pi TX (UART2 RX default) - FYSISKT GPIO16
+#define PI_TX_PIN 17          // ESP32 TX till Pi RX (UART2 TX default) - FYSISKT GPIO17
 
-const int pwmPinRF = 18, pwmPinRB = 19, pwmPinLF = 32, pwmPinLB = 33;
-const int pwmChannelA = 0, pwmChannelB = 1, pwmChannelC = 2, pwmChannelD = 3;
-const int pwmFreq = 5000, pwmResolution = 8;
+const int pwmPinRF = 18, pwmPinRB = 19, pwmPinLF = 32, pwmPinLB = 33; // Motorpins
+const int pwmChannelA = 0, pwmChannelB = 1, pwmChannelC = 2, pwmChannelD = 3; // ESP32 PWM kanaler
+const int pwmFreq = 5000, pwmResolution = 8; // PWM frekvens (Hz) och upplösning (bitar)
 
-const int analogBatteryPin = 39;
-const float R1 = 18000.0;
-const float R2 = 6700.0;
-const float G_ACCEL = 9.80665f; // Gravitationskonstant m/s^2
+const int analogBatteryPin = 39;    // GPIO39 (ADC1_CH3) för batterimätning
+const float R1 = 18000.0;           // 18 kΩ motstånd i spänningsdelare
+const float R2 = 6700.0;            // 6.7 kΩ motstånd i spänningsdelare
+const float G_ACCEL = 9.80665f;     // Gravitationskonstant m/s^2
 
-HardwareSerial DWMSerial(2);
-MPU9250_asukiaaa mySensor;
-Preferences preferences;
+HardwareSerial DWMSerial(1);   // UART1 objekt för DWM1001 (med anpassade pinnar)
+MPU9250_asukiaaa mySensor;   // Objekt för MPU9150 IMU
+Preferences preferences;     // Objekt för NVS (Non-Volatile Storage)
 
 // --- Globala variabler för sensorer och navigation ---
-float posX_raw_uwb=0, posY_raw_uwb=0; // Rå UWB-position
-float current_yaw_imu=0, current_pitch_imu=0, current_roll_imu=0; // Från IMU direkt
+float posX_raw_uwb=0, posY_raw_uwb=0; // Rå UWB-position (direkt från DWM1001)
+float current_yaw_imu=0, current_pitch_imu=0, current_roll_imu=0; // Euler-vinklar direkt från IMU
 
-bool targetActive = false;
-float targetX=0, targetY=0;
-float posTolerance = 0.10;
-float angleTolerance = 5.0;
+bool targetActive = false;      // Flagga: finns ett aktivt mål att köra till?
+float targetX=0, targetY=0;     // Mål X, Y koordinater från Pi
+float posTolerance = 0.10;      // Meter, positionstolerans för att nå målet
+float angleTolerance = 5.0;     // Grader, vinkeltolerans för orientering mot mål
 
-unsigned long lastEKFPredictTime_micros = 0;
-unsigned long lastUWBDataTime_millis = 0;
+unsigned long lastEKFPredictTime_micros = 0; // Senaste tidpunkt (mikrosekunder) EKF predict kördes
+unsigned long lastUWBDataTime_millis = 0;    // Senaste tidpunkt (millisekunder) UWB-data mottogs
 
-int dutyF = 75, dutyB = 146;
-const int baseDutyF = 75, baseDutyB = 146;
-const float nominalVoltage = 7.2f;
+int dutyF = 75, dutyB = 146; // Aktuell duty cycle för framåt/bakåt (dynamiskt justerad)
+const int baseDutyF = 75;    // Bas duty cycle för framåt vid nominell spänning
+const int baseDutyB = 146;   // Bas duty cycle för bakåt vid nominell spänning
+const float nominalVoltage = 7.2f; // Referensbatterispänning för bas duty cycles
 
+// DWM1001 TLV state machine variabler
 enum { WAIT_HEADER, READ_TYPE, READ_LEN, READ_VALUE, READ_CSUM } tlv_state = WAIT_HEADER;
 uint8_t tlv_type, tlv_len, tlv_value[32], tlv_valueIdx, tlv_cs;
 
@@ -76,11 +88,13 @@ void ekf_update_uwb(float uwb_x, float uwb_y);
 // --- Utility, Motor, Kalibrering (samma som tidigare) ---
 float measureBatteryVoltage() {
   int rawADC = analogRead(analogBatteryPin);
-  float voltageAtPin = (rawADC / 4095.0) * 3.575;
+  float voltageAtPin = (rawADC / 4095.0) * 3.575; // ESP32 ADC reference can vary, 3.3V or internal
   return voltageAtPin * (R1 + R2) / R2;
 }
 void updateDutyCycles() {
-  float voltageRatio = nominalVoltage / measureBatteryVoltage();
+  float currentVoltage = measureBatteryVoltage();
+  if (currentVoltage < 3.0) currentVoltage = nominalVoltage; // Avoid division by zero or extreme ratios if reading is bad
+  float voltageRatio = nominalVoltage / currentVoltage;
   dutyF = constrain(int(baseDutyF * voltageRatio), 0, 255);
   dutyB = constrain(int(baseDutyB * voltageRatio), 0, 255);
 }
@@ -97,12 +111,12 @@ void backward() {
   ledcWrite(pwmChannelC, 0); ledcWrite(pwmChannelD, dutyB);
 }
 void rotateLeft() {
-  ledcWrite(pwmChannelA, 0); ledcWrite(pwmChannelB, dutyB);
-  ledcWrite(pwmChannelC, dutyF); ledcWrite(pwmChannelD, 0);
+  ledcWrite(pwmChannelA, 0); ledcWrite(pwmChannelB, dutyB); 
+  ledcWrite(pwmChannelC, dutyF); ledcWrite(pwmChannelD, 0); 
 }
 void rotateRight() {
-  ledcWrite(pwmChannelA, dutyF); ledcWrite(pwmChannelB, 0);
-  ledcWrite(pwmChannelC, 0); ledcWrite(pwmChannelD, dutyB);
+  ledcWrite(pwmChannelA, dutyF); ledcWrite(pwmChannelB, 0); 
+  ledcWrite(pwmChannelC, 0); ledcWrite(pwmChannelD, dutyB); 
 }
 void calibrateGyro() {
   Serial.println("Gyro calibration...");
@@ -112,7 +126,7 @@ void calibrateGyro() {
   Serial.println("Gyro calibration done.");
 }
 void calibrateAccel() {
-  Serial.println("Accel calibration...");
+  Serial.println("Accel calibration (keep flat & still)...");
   float ax_sum=0, ay_sum=0, az_sum=0; int samples=200;
   for(int i=0; i<samples; ++i){ mySensor.accelUpdate(); ax_sum+=mySensor.accelX(); ay_sum+=mySensor.accelY(); az_sum+=mySensor.accelZ(); delay(5); }
   mySensor.setAccelBias(ax_sum/samples, ay_sum/samples, (az_sum/samples)-1.0f); // Assume Z up = +1G
@@ -130,7 +144,7 @@ bool loadMagCalibration() {
     mySensor.setMagCalibration(preferences.getFloat("magOffX",0), preferences.getFloat("magOffY",0), preferences.getFloat("magOffZ",0),
                                preferences.getFloat("magScaX",1), preferences.getFloat("magScaY",1), preferences.getFloat("magScaZ",1));
     Serial.println("Mag cal loaded.");
-  } else { Serial.println("No mag cal found."); }
+  } else { Serial.println("No mag cal found in NVS."); }
   preferences.end(); return success;
 }
 
@@ -160,22 +174,21 @@ void readDWM1001() {
 // --- Rörelselogik (använder EKF state x_est(4) för yaw) ---
 void handleMotion() {
   if (!targetActive) { stop(); return; }
-  float currentX = x_est(0); float currentY = x_est(1); float currentYaw = x_est(4);
+  float currentX = x_est(0); float currentY = x_est(1); float currentYaw = x_est(4); // Yaw is in radians
   float dx = targetX - currentX; float dy = targetY - currentY;
   float distToTarget = sqrt(dx*dx + dy*dy);
 
   if (distToTarget < posTolerance) {
-    stop(); targetActive = false; x_est(2)=0; x_est(3)=0; // Stoppa -> nollställ hastighet i EKF
+    stop(); targetActive = false; x_est(2)=0; x_est(3)=0; 
     Serial2.println("REACHED"); Serial.println("Target reached (EKF)!");
     return;
   }
   float targetAngleRad = atan2(dy, dx);
   float angleErrorRad = targetAngleRad - currentYaw;
-  // Normalisera angleErrorRad till [-PI, PI]
   while (angleErrorRad > M_PI) angleErrorRad -= 2.0f * M_PI;
   while (angleErrorRad < -M_PI) angleErrorRad += 2.0f * M_PI;
 
-  if (abs(angleErrorRad) > (angleTolerance * M_PI / 180.0f)) {
+  if (abs(angleErrorRad) > (angleTolerance * M_PI / 180.0f)) { 
     if (angleErrorRad > 0) rotateLeft(); else rotateRight();
   } else {
     forward();
@@ -184,137 +197,67 @@ void handleMotion() {
 
 // --- EKF Implementation ---
 void ekf_init() {
-  // Initial State Estimate (x, y, vx, vy, yaw)
-  x_est = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f}; // Start vid origo, stilla, noll yaw
-
-  // Initial State Covariance (P) - Osäkerhet i initial state
-  // Start med hög osäkerhet i position och hastighet, lägre i yaw om kalibrerad
-  P.Fill(0); // Nollställ först
-  P(0,0) = 1.0f; P(1,1) = 1.0f; // Stor osäkerhet i x, y pos (m^2)
-  P(2,2) = 1.0f; P(3,3) = 1.0f; // Stor osäkerhet i vx, vy (m/s)^2
-  P(4,4) = pow(10.0 * M_PI / 180.0, 2); // Osäkerhet i yaw (rad^2), t.ex. 10 grader
-
-  // Process Noise Covariance (Q) - Hur mycket litar vi på rörelsemodellen?
-  // Diagonalmatris. Större värden = mindre tilltro till modellen (mer brus i processen)
-  // Behöver TUNEAS! Dessa är bara startvärden.
+  x_est = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f}; 
+  P.Fill(0); 
+  P(0,0) = 1.0f; P(1,1) = 1.0f; 
+  P(2,2) = 1.0f; P(3,3) = 1.0f; 
+  P(4,4) = pow(15.0f * M_PI / 180.0f, 2); 
   Q.Fill(0);
-  float dt_nom = 0.02f; // Nominell dt för brusmodell (t.ex. 50Hz)
-  Q(0,0) = 0.01f * dt_nom; Q(1,1) = 0.01f * dt_nom; // Brus i position (från omodellerad dynamik)
-  Q(2,2) = pow(0.5f * dt_nom, 2); // Brus i hastighet (från acc brus) m/s
-  Q(3,3) = pow(0.5f * dt_nom, 2); // Brus i hastighet m/s
-  Q(4,4) = pow(1.0f * M_PI/180.0f * dt_nom, 2); // Brus i yaw (från gyro drift) rad/s
-
-  // UWB Measurement Noise Covariance (R_uwb)
-  // Hur mycket litar vi på UWB-mätningarna? Diagonalmatris.
-  // Behöver TUNEAS! Baseras på UWB-noggrannhet (t.ex. 0.1m std dev -> 0.01 m^2 varians)
+  float dt_nom_q = 0.02f; 
+  Q(0,0) = pow(0.02f * dt_nom_q, 2); Q(1,1) = pow(0.02f * dt_nom_q, 2); 
+  Q(2,2) = pow(0.2f * dt_nom_q, 2);  Q(3,3) = pow(0.2f * dt_nom_q, 2);  
+  Q(4,4) = pow(2.0f * M_PI/180.0f * dt_nom_q, 2); 
   R_uwb.Fill(0);
-  R_uwb(0,0) = pow(0.15f, 2); // Varians för UWB x-mätning (m^2)
-  R_uwb(1,1) = pow(0.15f, 2); // Varians för UWB y-mätning (m^2)
-
+  R_uwb(0,0) = pow(0.15f, 2); R_uwb(1,1) = pow(0.15f, 2); 
   lastEKFPredictTime_micros = micros();
   Serial.println("EKF Initialized.");
 }
 
 void ekf_predict(float acc_x_body_gs, float acc_y_body_gs, float gyro_z_dps, float dt) {
-  if (dt <= 0) return;
-
-  // Aktuell state
-  float prev_x = x_est(0);
-  float prev_y = x_est(1);
-  float prev_vx = x_est(2);
-  float prev_vy = x_est(3);
+  if (dt <= 1e-6f) return; 
+  float prev_x = x_est(0); float prev_y = x_est(1);
+  float prev_vx = x_est(2); float prev_vy = x_est(3);
   float prev_yaw = x_est(4);
-
-  // Konvertera IMU-inputs
   float acc_x_body_mps2 = acc_x_body_gs * G_ACCEL;
-  float acc_y_body_mps2 = acc_y_body_gs * G_ACCEL; // Används om modellen inkluderar lateral acc
+  float acc_y_body_mps2 = acc_y_body_gs * G_ACCEL; 
   float gyro_z_rps = gyro_z_dps * M_PI / 180.0f;
-
-  // State Transition Model (f(x,u)) - förutspådd state x_pred
   BLA::Matrix<STATE_SIZE> x_pred;
-  x_pred(4) = prev_yaw + gyro_z_rps * dt; // Ny yaw
-  // Normalisera yaw till [-PI, PI]
+  x_pred(4) = prev_yaw + gyro_z_rps * dt;
   while (x_pred(4) > M_PI) x_pred(4) -= 2.0f * M_PI;
   while (x_pred(4) < -M_PI) x_pred(4) += 2.0f * M_PI;
-  
-  // Acceleration i världsramen (world frame)
-  // Antag att acc_x_body är framåt, acc_y_body är sidledes (om den används)
-  float world_ax = acc_x_body_mps2 * cos(prev_yaw) - acc_y_body_mps2 * sin(prev_yaw);
-  float world_ay = acc_x_body_mps2 * sin(prev_yaw) + acc_y_body_mps2 * cos(prev_yaw);
-
-  x_pred(2) = prev_vx + world_ax * dt; // Ny vx (world)
-  x_pred(3) = prev_vy + world_ay * dt; // Ny vy (world)
-  x_pred(0) = prev_x + prev_vx * dt + 0.5f * world_ax * dt * dt; // Ny x (world)
-  x_pred(1) = prev_y + prev_vy * dt + 0.5f * world_ay * dt * dt; // Ny y (world)
-  
-  x_est = x_pred; // Uppdatera state estimate med prediction
-
-  // Jacobian av State Transition Model (F)
-  BLA::Matrix<STATE_SIZE, STATE_SIZE> F;
-  F.Fill(0); // Nollställ
-  // d(x_new)/d(x_old)
-  F(0,0) = 1; F(0,2) = dt; F(0,4) = (-acc_x_body_mps2 * sin(prev_yaw) - acc_y_body_mps2 * cos(prev_yaw)) * 0.5f * dt * dt; // d(x)/d(yaw) via world_ax
-  F(1,1) = 1; F(1,3) = dt; F(1,4) = ( acc_x_body_mps2 * cos(prev_yaw) - acc_y_body_mps2 * sin(prev_yaw)) * 0.5f * dt * dt; // d(y)/d(yaw) via world_ay
-  // d(vx_new)/d(vx_old) etc.
-  F(2,2) = 1; F(2,4) = (-acc_x_body_mps2 * sin(prev_yaw) - acc_y_body_mps2 * cos(prev_yaw)) * dt; // d(vx)/d(yaw)
-  F(3,3) = 1; F(3,4) = ( acc_x_body_mps2 * cos(prev_yaw) - acc_y_body_mps2 * sin(prev_yaw)) * dt; // d(vy)/d(yaw)
-  F(4,4) = 1; // d(yaw_new)/d(yaw_old)
-
-  // Uppdatera state covariance: P = F * P * F_transpose + Q
-  P = F * P * ~F + Q;
+  float cos_prev_yaw = cos(prev_yaw); float sin_prev_yaw = sin(prev_yaw);
+  float world_ax = acc_x_body_mps2 * cos_prev_yaw - acc_y_body_mps2 * sin_prev_yaw;
+  float world_ay = acc_x_body_mps2 * sin_prev_yaw + acc_y_body_mps2 * cos_prev_yaw;
+  x_pred(2) = prev_vx + world_ax * dt; x_pred(3) = prev_vy + world_ay * dt;
+  x_pred(0) = prev_x + prev_vx * dt + 0.5f * world_ax * dt * dt;
+  x_pred(1) = prev_y + prev_vy * dt + 0.5f * world_ay * dt * dt;
+  x_est = x_pred; 
+  BLA::Matrix<STATE_SIZE, STATE_SIZE> F; F.Fill(0);
+  F(0,0) = 1; F(0,2) = dt; F(0,4) = (-acc_x_body_mps2 * sin_prev_yaw - acc_y_body_mps2 * cos_prev_yaw) * 0.5f * dt * dt;
+  F(1,1) = 1; F(1,3) = dt; F(1,4) = ( acc_x_body_mps2 * cos_prev_yaw - acc_y_body_mps2 * sin_prev_yaw) * 0.5f * dt * dt;
+  F(2,2) = 1; F(2,4) = (-acc_x_body_mps2 * sin_prev_yaw - acc_y_body_mps2 * cos_prev_yaw) * dt;
+  F(3,3) = 1; F(3,4) = ( acc_x_body_mps2 * cos_prev_yaw - acc_y_body_mps2 * sin_prev_yaw) * dt;
+  F(4,4) = 1; 
+  P = F * P * ~F + Q; 
 }
 
 void ekf_update_uwb(float uwb_x, float uwb_y) {
-  // Measurement z
-  BLA::Matrix<UWB_MEASUREMENT_SIZE> z = {uwb_x, uwb_y};
-
-  // Jacobian av Measurement Model (H_uwb)
-  // Mätningsmodell: z_x = x, z_y = y
-  BLA::Matrix<UWB_MEASUREMENT_SIZE, STATE_SIZE> H_uwb;
-  H_uwb.Fill(0);
-  H_uwb(0,0) = 1; // d(z_x)/d(x)
-  H_uwb(1,1) = 1; // d(z_y)/d(y)
-
-  // Kalman Gain (K)
-  // K = P * H_transpose * inv(H * P * H_transpose + R)
-  BLA::Matrix<STATE_SIZE, UWB_MEASUREMENT_SIZE> K;
+  BLA::Matrix<UWB_MEASUREMENT_SIZE> z = {uwb_x, uwb_y}; 
+  BLA::Matrix<UWB_MEASUREMENT_SIZE, STATE_SIZE> H_uwb; H_uwb.Fill(0);
+  H_uwb(0,0) = 1; H_uwb(1,1) = 1; 
+  BLA::Matrix<UWB_MEASUREMENT_SIZE, UWB_MEASUREMENT_SIZE> S = H_uwb * P * ~H_uwb + R_uwb;
   BLA::Matrix<UWB_MEASUREMENT_SIZE, UWB_MEASUREMENT_SIZE> S_inv;
-  S_inv = H_uwb * P * ~H_uwb + R_uwb;
-  
-  // Försök invertera S. Om inte inverterbar, skippa update (eller hantera robust).
-  // BasicLinearAlgebra har inte direkt inv() för alla matriser, men för 2x2 kan det göras manuellt
-  // eller så hoppas vi att den är positivt definit och inverterbar.
-  // För enkelhetens skull, anta att inv() fungerar eller att vi har en robust version.
-  // Om biblioteket inte har inv(), måste vi implementera det för 2x2 S_inv.
-  // S_inv = S_inv.Inverse(); // Om biblioteket stöder det.
-  // Manuell 2x2 inversion för S = [[a,b],[c,d]] -> S_inv = (1/(ad-bc)) * [[d,-b],[-c,a]]
-  float det_S = S_inv(0,0)*S_inv(1,1) - S_inv(0,1)*S_inv(1,0);
-  if (abs(det_S) < 1e-9) { // Nära singulär, skippa update
-      Serial.println("EKF UWB Update: S matrix singular, skipping update.");
-      return;
-  }
-  BLA::Matrix<UWB_MEASUREMENT_SIZE, UWB_MEASUREMENT_SIZE> S_temp = S_inv; // Kopiera för inversion
-  S_inv(0,0) = S_temp(1,1) / det_S;
-  S_inv(1,1) = S_temp(0,0) / det_S;
-  S_inv(0,1) = -S_temp(0,1) / det_S;
-  S_inv(1,0) = -S_temp(1,0) / det_S;
-
-
-  K = P * ~H_uwb * S_inv;
-
-  // State Update: x_est = x_est_predicted + K * (z - H * x_est_predicted)
-  BLA::Matrix<UWB_MEASUREMENT_SIZE> y_residual = z - (H_uwb * x_est); // x_est är x_est_predicted här
+  float det_S = S(0,0)*S(1,1) - S(0,1)*S(1,0);
+  if (abs(det_S) < 1e-9f) { Serial.println("EKF UWB Update: S matrix singular, skipping update."); return; }
+  S_inv(0,0) = S(1,1) / det_S; S_inv(1,1) = S(0,0) / det_S;
+  S_inv(0,1) = -S(0,1) / det_S; S_inv(1,0) = -S(1,0) / det_S;
+  BLA::Matrix<STATE_SIZE, UWB_MEASUREMENT_SIZE> K = P * ~H_uwb * S_inv;
+  BLA::Matrix<UWB_MEASUREMENT_SIZE> y_residual = z - (H_uwb * x_est); 
   x_est = x_est + K * y_residual;
-  // Normalisera yaw igen efter update
   while (x_est(4) > M_PI) x_est(4) -= 2.0f * M_PI;
   while (x_est(4) < -M_PI) x_est(4) += 2.0f * M_PI;
-
-
-  // Covariance Update: P = (I - K * H) * P
-  BLA::Matrix<STATE_SIZE, STATE_SIZE> I; 
-  I.Identity(); // Enhetsmatris
+  BLA::Matrix<STATE_SIZE, STATE_SIZE> I; I.Identity(); 
   P = (I - K * H_uwb) * P;
-
   Serial.println("EKF UWB Update Applied.");
 }
 
@@ -322,86 +265,66 @@ void ekf_update_uwb(float uwb_x, float uwb_y) {
 // --- Setup ---
 void setup() {
   Serial.begin(115200);
-  Serial.println("ESP32 AGV Starting (EKF)...");
+  Serial.println("ESP32 AGV Starting (EKF - DWM on GPIO 25/26)...");
 
-  Serial2.begin(115200, SERIAL_8N1, PI_RX_PIN, PI_TX_PIN);
-  Serial.print("Serial2 (to Pi) on RX:"); Serial.print(PI_RX_PIN); Serial.print(", TX:"); Serial.println(PI_TX_PIN);
+  // UART for Raspberry Pi (UART2 - default pins GPIO 16, 17)
+  Serial2.begin(115200); 
+  Serial.print("Serial2 (Pi) on UART2: RX="); Serial.print(PI_RX_PIN); Serial.print("(def), TX="); Serial.print(PI_TX_PIN); Serial.println("(def)");
   
   analogReadResolution(12);
   ledcAttachPin(pwmPinRF, pwmChannelA); ledcSetup(pwmChannelA, pwmFreq, pwmResolution);
-  // ... (resten av motor-setup)
   ledcAttachPin(pwmPinRB, pwmChannelB); ledcSetup(pwmChannelB, pwmFreq, pwmResolution);
   ledcAttachPin(pwmPinLF, pwmChannelC); ledcSetup(pwmChannelC, pwmFreq, pwmResolution);
   ledcAttachPin(pwmPinLB, pwmChannelD); ledcSetup(pwmChannelD, pwmFreq, pwmResolution);
   stop(); delay(500);
 
-  Wire.begin(21, 22); mySensor.setWire(&Wire);
+  Wire.begin(21, 22); 
+  mySensor.setWire(&Wire);
   mySensor.beginAccel(); mySensor.beginGyro();
   calibrateGyro(); calibrateAccel();
   mySensor.beginMag();
   if (!loadMagCalibration()) {
-    Serial.println("Starting NEW Mag Calibration..."); delay(5000);
+    Serial.println("Starting NEW Mag Calibration in 5s (rotate robot fully)..."); delay(5000);
     mySensor.magCalibration(); saveMagCalibration();
   }
   
-  DWMSerial.begin(DWM_BAUD, SERIAL_8N1, DWM_RX, DWM_TX);
-  Serial.print("DWMSerial (UWB) on RX:"); Serial.print(DWM_RX); Serial.print(", TX:"); Serial.println(DWM_TX);
+  // UART for DWM1001 (UART1 - custom pins DWM_RX_PIN, DWM_TX_PIN)
+  DWMSerial.begin(DWM_BAUD, SERIAL_8N1, DWM_RX_PIN, DWM_TX_PIN);
+  Serial.print("DWMSerial (UWB) on UART1: RX="); Serial.print(DWM_RX_PIN); Serial.print(", TX="); Serial.println(DWM_TX_PIN);
   delay(500);
-  // DWM1001 init commands (samma som tidigare)
   uint8_t setRate[]={0x00,0x64,0x00,0x64}; DWMSerial.write(0x0D); DWMSerial.write(0x0A); DWMSerial.write(4); for(int i=0;i<4;++i)DWMSerial.write(setRate[i]); DWMSerial.write(0x0A^4^setRate[0]^setRate[1]^setRate[2]^setRate[3]); delay(100);
   uint8_t subscribe[]={0x02,0x00,0x64}; DWMSerial.write(0x0D); DWMSerial.write(0x14); DWMSerial.write(3); for(int i=0;i<3;++i)DWMSerial.write(subscribe[i]); DWMSerial.write(0x14^3^subscribe[0]^subscribe[1]^subscribe[2]); delay(100);
   uint8_t filterOff[]={0x00}; DWMSerial.write(0x0D); DWMSerial.write(0x43); DWMSerial.write(1); DWMSerial.write(0x00); DWMSerial.write(0x43^1^0x00);
 
-  ekf_init(); // Initialisera EKF state och kovarianser
+  ekf_init(); 
 
-  Serial.println("ESP32 EKF READY");
+  Serial.println("ESP32 EKF READY (DWM on GPIO 25/26)");
 }
 
 // --- Loop ---
 void loop() {
   updateDutyCycles();
-  readDWM1001(); // Kollar efter ny UWB data, uppdaterar posX_raw_uwb, posY_raw_uwb, lastUWBDataTime_millis
-
-  // --- EKF Predict Step (hög frekvens) ---
+  readDWM1001(); 
   unsigned long currentTime_micros = micros();
-  float dt = (currentTime_micros - lastEKFPredictTime_micros) / 1000000.0f; // dt i sekunder
-  
-  if (dt > 0.001f && dt < 0.1f) { // Rimlig dt (1ms till 100ms)
+  float dt = (currentTime_micros - lastEKFPredictTime_micros) / 1000000.0f; 
+  if (dt > 0.0005f && dt < 0.1f) { 
     lastEKFPredictTime_micros = currentTime_micros;
-
-    // Hämta IMU-data
-    mySensor.accelUpdate(); mySensor.gyroUpdate(); mySensor.magUpdate();
-    mySensor.computeEulerAngles(true); // Detta uppdaterar mySensor.yaw etc.
-    current_yaw_imu = mySensor.yaw * M_PI / 180.0f; // Används för debug, EKF har sin egen yaw
-                                                // Men MPU9250 lib:s yaw (med mag) är bra för gyro_z input
-                                                // om vi inte direkt använder gyro_z.
-                                                // Här använder vi gyro_z direkt.
-    
-    float acc_x_body = mySensor.accelX(); // i Gs
-    float acc_y_body = mySensor.accelY(); // i Gs (kan användas för mer avancerad modell)
-    float gyro_z_dps = mySensor.gyroZ();  // i grader per sekund
-
+    mySensor.accelUpdate(); mySensor.gyroUpdate(); 
+    float acc_x_body = mySensor.accelX(); float acc_y_body = mySensor.accelY(); 
+    float gyro_z_dps = mySensor.gyroZ();  
     ekf_predict(acc_x_body, acc_y_body, gyro_z_dps, dt);
   } else if (dt >= 0.1f) {
-      // Lång dt, återställ tiden för att undvika stora hopp om loopen blockerats
-      lastEKFPredictTime_micros = currentTime_micros;
+      lastEKFPredictTime_micros = currentTime_micros; 
       Serial.println("WARN: Long EKF predict dt, time reset.");
-  }
-
-
-  // --- EKF Update Step (när ny UWB-data finns) ---
+  } 
   static unsigned long lastUWBProcessTime_millis = 0;
   if (lastUWBDataTime_millis > lastUWBProcessTime_millis) {
     lastUWBProcessTime_millis = lastUWBDataTime_millis;
     Serial.print("New UWB data: Xraw="); Serial.print(posX_raw_uwb); Serial.print(", Yraw="); Serial.println(posY_raw_uwb);
     ekf_update_uwb(posX_raw_uwb, posY_raw_uwb);
-
-    // Skicka EKF-estimerad position till Pi efter UWB-uppdatering
     Serial2.print("POS,"); 
     Serial2.print(x_est(0), 2); Serial2.print(","); Serial2.println(x_est(1), 2);
   }
-
-  // --- Kommandon från Raspberry Pi ---
   if (Serial2.available()) {
     String cmd = Serial2.readStringUntil('\n'); cmd.trim();
     if (cmd.startsWith("GO,")) {
@@ -414,23 +337,19 @@ void loop() {
       }
     } else if (cmd == "STOP") {
       stop(); targetActive = false; 
-      x_est(2) = 0.0f; x_est(3) = 0.0f; // Nollställ hastigheter i EKF state
+      x_est(2) = 0.0f; x_est(3) = 0.0f; 
       Serial.println("STOP command (EKF).");
     }
   }
-
-  handleMotion(); // Använder x_est från EKF
-
-  // --- Periodisk Debug Utskrift ---
+  handleMotion(); 
   static unsigned long lastDebugPrintTime = 0;
   unsigned long currentMillis = millis();
-  if (currentMillis - lastDebugPrintTime >= 500) { // Var 0.5 sekund
+  if (currentMillis - lastDebugPrintTime >= 500) { 
     lastDebugPrintTime = currentMillis;
-    Serial.print("EKF State: x="); Serial.print(x_est(0),2);
+    Serial.print("EKF: x="); Serial.print(x_est(0),2);
     Serial.print(" y="); Serial.print(x_est(1),2);
     Serial.print(" vx="); Serial.print(x_est(2),2);
     Serial.print(" vy="); Serial.print(x_est(3),2);
     Serial.print(" yaw="); Serial.print(x_est(4) * 180.0/M_PI,1); Serial.println(" deg");
-    // Serial.print("P diag: "); Serial.print(P(0,0),4); Serial.print(" "); Serial.print(P(1,1),4); Serial.print(" "); Serial.print(P(2,2),4); Serial.print(" "); Serial.print(P(3,3),4); Serial.print(" "); Serial.println(P(4,4),4);
   }
 }
