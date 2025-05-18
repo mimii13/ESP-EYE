@@ -1,0 +1,391 @@
+import bluetooth
+import time
+import os
+import serial
+import struct
+import threading
+import math
+import numpy as np
+import collections
+
+# === Globala Variabler for Lidar-Move-Control (som tidigare) ===
+current_lidar_scan_for_move_control = [0.0] * 360
+lidar_scan_for_move_control_lock = threading.Lock()
+
+# === KONFIGURATION (fran din kod) ===
+position_lock = threading.Lock()
+position_buffer_x = collections.deque(maxlen=5)
+position_buffer_y = collections.deque(maxlen=5)
+JUMP_THRESHOLD = 30
+SMOOTHING_FACTOR = 0.2
+x, y = 80.0, 200.0
+lidar_active = False
+LIDAR_PORT = "/dev/ttyUSB0"
+LIDAR_BAUDRATE = 460800
+CMD_STOP = b'\xA5\x25'
+CMD_SCAN = b'\xA5\x20'
+# check_angles kan tas bort om den inte anvands pa annat satt, da temp_array storlek ar hardkodad till 360
+esp_serial = serial.Serial('/dev/ttyS0', 115200, timeout=1)
+
+# === Kalmanfilterkonfiguration (som tidigare) ===
+kalman_x = {
+    'x': 80.0, 'v': 0.0, 'P': np.array([[15, 5], [5, 15]], dtype=np.float32)
+}
+kalman_y = {
+    'x': 200.0, 'v': 0.0, 'P': np.array([[15, 5], [5, 15]], dtype=np.float32)
+}
+dt = 0.1
+
+def kalman_update(kalman_state, acc, measurement=None): # Som tidigare
+    dt_local = 0.1
+    def calculate_dynamic_Q(speed):
+        factor = max(1, speed / 10)
+        return np.array([[0.5 * factor, 0], [0, 0.5 * factor]])
+    def calculate_dynamic_R(speed):
+        R_base_local = 5.0
+        return max(R_base_local / max(speed, 1), 5.0)
+    A = np.array([[1, dt_local], [0, 1]])
+    B = np.array([[0.5 * dt_local**2], [dt_local]])
+    x_vec_kalman = np.array([[kalman_state['x']], [kalman_state['v']]])
+    u_vec_kalman = np.array([[acc]])
+    speed = np.abs(kalman_state['v'])
+    dynamic_Q_val = calculate_dynamic_Q(speed)
+    x_pred = A @ x_vec_kalman + B @ u_vec_kalman
+    P_pred = A @ kalman_state['P'] @ A.T + dynamic_Q_val
+    dynamic_R_val = calculate_dynamic_R(speed)
+    if measurement is not None:
+        H = np.array([[1, 0]])
+        z_vec_kalman = np.array([[measurement]])
+        y_err = z_vec_kalman - H @ x_pred
+        S_val = H @ P_pred @ H.T + dynamic_R_val
+        S_inv = 0
+        if np.isscalar(S_val):
+            if S_val == 0: S_inv = 0
+            else: S_inv = 1.0 / S_val
+            K = P_pred @ H.T * S_inv
+        else:
+            try: K = P_pred @ H.T @ np.linalg.inv(S_val)
+            except np.linalg.LinAlgError: K = P_pred @ H.T @ np.linalg.pinv(S_val)
+        if speed > 5: K = K * 1.5
+        x_new = x_pred + K @ y_err
+        P_new = (np.eye(2) - K @ H) @ P_pred
+    else:
+        x_new = x_pred
+        P_new = P_pred
+    kalman_state['x'] = x_new[0, 0]
+    kalman_state['v'] = x_new[1, 0]
+    kalman_state['P'] = P_new
+    return kalman_state['x']
+
+def get_descriptor(ser_lidar_desc): # Som tidigare
+    descriptor = ser_lidar_desc.read(7)
+    if descriptor[:2] != b'\xA5\x5A':
+        raise Exception("Misslyckades med att ta emot scan descriptor")
+
+def update_position(new_x_pos, new_y_pos): # Som tidigare
+    global x, y
+    with position_lock:
+        x, y = new_x_pos, new_y_pos
+
+def get_position(): # Som tidigare
+    global x, y
+    with position_lock:
+        return x, y
+
+# === parse_packet MED JUSTERING for att returnera is_scan_start_point ===
+def parse_packet(packet_data):
+    if len(packet_data) != 5:
+        return None, None, None, None # Returnera None for alla varden vid fel
+    b0, b1, b2, b3, b4 = struct.unpack('<BBBBB', packet_data)
+    
+    start_flag = b0 & 0x01  # S bit (bit 0)
+    inverted_start_flag = (b0 >> 1) & 0x01 # S inverted bit (bit 1)
+    
+    # Korrekt kontroll for startflaggor (en maste vara 0, den andra 1)
+    if not (start_flag ^ inverted_start_flag):
+        return None, None, None, None 
+        
+    quality = b0 >> 2
+    angle_q6 = ((b2 << 7) | (b1 >> 1)) # Din originala berakning
+    angle = (angle_q6 / 64.0) # % 360 # Låt oss inte modulera här, utan i lidar_task
+    
+    dist_q2 = (b4 << 8) | b3
+    distance_cm = round((dist_q2 / 4.0) / 10.0)
+
+    # Identifiera om detta ar startpunkten for en ny skanning
+    # For RPLIDAR A1: S-biten (start_flag) ar 1 for den forsta punkten i en ny 360-graders skanning.
+    is_scan_start_point = (start_flag == 1 and inverted_start_flag == 0)
+    
+    return angle, max(0, distance_cm), quality, is_scan_start_point
+
+# === lidar_task MED JUSTERINGAR for att anvanda is_scan_start_point ===
+def lidar_task(client_sock_param):
+    global lidar_active, current_lidar_scan_for_move_control, lidar_scan_for_move_control_lock
+    
+    local_lidar_active_flag = True 
+    print(f"[AGV] Lidar-trad startad (Klient: {'Aktiv' if client_sock_param else 'Ingen'}).")
+    
+    temp_array_local = [0.0] * 360 # Array for att lagra en hel skanning
+    # Flagga for att veta om vi har sett den allra forsta "start_scan"-punkten an.
+    # Detta for att undvika att processa en tom/ofullstandig skanning forsta gangen.
+    a_scan_has_started_and_completed_once = False
+
+    try:
+        with serial.Serial(LIDAR_PORT, LIDAR_BAUDRATE, timeout=1) as ser_lidar:
+            ser_lidar.write(CMD_STOP)
+            time.sleep(0.1)
+            ser_lidar.reset_input_buffer()
+            ser_lidar.write(CMD_SCAN)
+            get_descriptor(ser_lidar)
+
+            lidar_active = True # Satter global flagga
+
+            while local_lidar_active_flag and lidar_active:
+                packet = ser_lidar.read(5)
+                if len(packet) != 5:
+                    # print("[AGV] LIDAR: Ofullstandigt paket.")
+                    continue
+                
+                angle, distance_cm, quality, is_scan_start_point = parse_packet(packet)
+                
+                if angle is None: # Om parse_packet returnerade fel
+                    # print("[AGV] LIDAR: Ogiltigt paket.")
+                    continue
+                
+                # Om detta ar en "start_scan_point", betyder det att den *foregaende* skanningen
+                # (som finns i temp_array_local) nu ar komplett.
+                if is_scan_start_point and a_scan_has_started_and_completed_once:
+                    # Processera den nyss avslutade skanningen som finns i temp_array_local
+                    with lidar_scan_for_move_control_lock:
+                        current_lidar_scan_for_move_control = list(temp_array_local) # Skapa en kopia
+                    
+                    if client_sock_param:
+                        try:
+                            # Anvand den just kopierade datan for att skicka
+                            lidar_string = "LIDAR:" + ",".join(map(str, current_lidar_scan_for_move_control))
+                            client_sock_param.send((lidar_string + "\n").encode("utf-8"))
+                        except OSError:
+                            print("[AGV] Lidar: Klientanslutning bruten (sändning).")
+                            local_lidar_active_flag = False
+                        except Exception as e_send:
+                            print(f"[AGV] Lidar: Fel vid sändning till klient: {e_send}")
+                            local_lidar_active_flag = False
+                    
+                    # Valfritt: Nollstall temp_array_local for den nya skanningen for att undvika gammal data
+                    # om den nya skanningen ar glesare. Detta ar dock inte kritiskt om
+                    # send_move_commands korrekt hanterar 0-varden (vilket den gor).
+                    # temp_array_local = [0.0] * 360
+
+                # Uppdatera alltid temp_array_local med den aktuella punktens data
+                # Detta sker oavsett om det var en startpunkt eller inte.
+                # Vinkeln fran Lidar ar typiskt 0-359.99...
+                angle_rounded = int(round(angle)) % 360 # Se till att vinkeln ar 0-359
+                if 0 <= angle_rounded < 360 : # Extra säkerhetskoll
+                    temp_array_local[angle_rounded] = float(distance_cm)
+
+                if is_scan_start_point:
+                    # Markera att vi har sett atminstone en startpunkt, sa nasta gang
+                    # en startpunkt kommer, vet vi att en hel skanning har passerat.
+                    a_scan_has_started_and_completed_once = True
+
+    except serial.SerialException as e_serial:
+        print(f"[AGV] LIDAR seriell portfel i lidar_task: {e_serial}.")
+    except Exception as e:
+        print(f"[AGV] LIDAR-fel i lidar_task: {e}")
+    finally:
+        lidar_active = False 
+        print(f"[AGV] Lidar-trad avslutad (Klient: {'Aktiv' if client_sock_param else 'Ingen'}).")
+
+# === dwm_position_task (som tidigare) ===
+def dwm_position_task(client_sock):
+    global x, y 
+    ax_local_dwm, ay_local_dwm = 0.0, 0.0 
+    try:
+        with serial.Serial("/dev/ttyACM0", 115200, timeout=1) as ser_dwm:
+            ser_dwm.write(b"\r"); time.sleep(0.1); ser_dwm.write(b"\r"); time.sleep(0.1)
+            start_time_dwm = time.time()
+            while time.time() - start_time_dwm < 2:
+                if ser_dwm.in_waiting:
+                    if "dwm>" in ser_dwm.readline().decode("utf-8", errors='ignore').strip(): break
+            ser_dwm.write(b'lep\r'); time.sleep(0.2)
+            print("[AGV] DWM-positionering startad.")
+            while True:
+                if esp_serial.in_waiting:
+                    esp_line = esp_serial.readline().decode("utf-8", errors='ignore').strip()
+                    if esp_line.startswith("mpu:"):
+                        try:
+                            parts = esp_line.replace("mpu:", "").split(",")
+                            ax_local_dwm = float(parts[0].split(":")[1])
+                            ay_local_dwm = float(parts[1].split(":")[1])
+                        except: pass # Ignorera parsningsfel for MPU for enkelhet
+                if ser_dwm.in_waiting:
+                    line_dwm = ser_dwm.readline().decode("utf-8", errors='ignore').strip()
+                    if line_dwm.startswith("POS,"):
+                        parts_dwm = line_dwm.split(",")
+                        if len(parts_dwm) >= 4:
+                            try:
+                                raw_x_dwm = float(parts_dwm[2]) * 100.0
+                                raw_y_dwm = float(parts_dwm[3]) * 100.0
+                                x_filtered = kalman_update(kalman_x, ax_local_dwm, raw_x_dwm)
+                                y_filtered = kalman_update(kalman_y, ay_local_dwm, raw_y_dwm)
+                                update_position(round(x_filtered, 1), round(y_filtered, 1))
+                                client_sock.send(f"POS:{x_filtered:.1f},{y_filtered:.1f}\r\n".encode("utf-8"))
+                            except: pass # Ignorera parsningsfel for DWM
+                time.sleep(0.01)
+    except serial.SerialException as e_serial_dwm: print(f"[AGV] DWM seriell portfel: {e_serial_dwm}")                            
+    except OSError: print("[AGV] DWM: Klientanslutning bruten.")
+    except Exception as e_dwm: print(f"[AGV] DWM-fel: {e_dwm}")
+    finally: print("[AGV] DWM-positioneringstrad avslutad.")
+
+# === send_move_commands (som tidigare, anvander den globala Lidar-datan) ===
+def send_move_commands(esp_serial_param, target_x_str, target_y_str, angle_cmd_char):
+    global current_lidar_scan_for_move_control, lidar_scan_for_move_control_lock
+
+    try:
+        target_x_coord = float(target_x_str)
+        target_y_coord = float(target_y_str)
+    except ValueError as e_conv:
+        print(f"[AGV] Fel vid konvertering av koordinater: {e_conv}")
+        esp_serial_param.write(b'9'); return
+
+    current_x_pos, current_y_pos = get_position()
+    dx_total = target_x_coord - current_x_pos
+    dy_total = target_y_coord - current_y_pos
+    distance_to_target_cm = math.sqrt(dx_total**2 + dy_total**2)
+    print(f"[AGV] send_move_commands: Mal ({target_x_coord:.1f}, {target_y_coord:.1f}). Nuvarande ({current_x_pos:.1f}, {current_y_pos:.1f}). Dist: {distance_to_target_cm:.1f} cm. VinkelCmd: '{angle_cmd_char}'")
+
+    if angle_cmd_char.isdigit():
+        command_byte_rotation = angle_cmd_char.encode()
+        if command_byte_rotation != b'0':
+            print(f"[AGV] Skickar initialt rotationskommando: {command_byte_rotation.decode()}")
+            esp_serial_param.write(command_byte_rotation)
+            if command_byte_rotation in [b'2', b'3', b'4', b'5', b'6', b'7', b'8']: time.sleep(0.7)
+            elif command_byte_rotation == b'9': print("[AGV] Stoppkommando mottaget initialt."); return
+    else:
+        print(f"[AGV] Ogiltigt vinkelkommando: {angle_cmd_char}. Skickar stopp."); esp_serial_param.write(b'9'); return
+    
+    MIN_DIST_FOR_LIDAR_GUIDED_MOVE = 5.0
+    if distance_to_target_cm < MIN_DIST_FOR_LIDAR_GUIDED_MOVE:
+        print(f"[AGV] Malet for nara ({distance_to_target_cm:.1f} cm) for Lidar-guidad rorelse."); return
+
+    print(f"[AGV] Paborjar Lidar-guidad framatrorelse: {distance_to_target_cm:.1f} cm.")
+    num_points_avg = 3
+    front_angle_indices = [(0 + i) % 360 for i in range(- (num_points_avg // 2) , (num_points_avg // 2) +1 )]
+    rear_angle_indices = [(180 + i) % 360 for i in range(- (num_points_avg // 2) , (num_points_avg // 2) +1 )]
+    initial_front_dist_avg = 0
+    initial_rear_dist_avg = 0
+
+    with lidar_scan_for_move_control_lock:
+        if not any(d > 0 for d in current_lidar_scan_for_move_control): # Kontrollera om det finns nagon giltig data
+            print("[AGV] Lidar-data ej tillganglig/tom for initial skanning. Avbryter."); esp_serial_param.write(b'9'); return
+        valid_front_distances = [current_lidar_scan_for_move_control[i] for i in front_angle_indices if current_lidar_scan_for_move_control[i] > 0]
+        valid_rear_distances = [current_lidar_scan_for_move_control[i] for i in rear_angle_indices if current_lidar_scan_for_move_control[i] > 0]
+
+    if not valid_front_distances or not valid_rear_distances:
+        print("[AGV] Inte tillrackligt med giltig Lidar-data (fram/bak) for initial skanning. Avbryter."); esp_serial_param.write(b'9'); return
+    
+    initial_front_dist_avg = sum(valid_front_distances) / len(valid_front_distances)
+    initial_rear_dist_avg = sum(valid_rear_distances) / len(valid_rear_distances)
+    print(f"[AGV] Initial Lidar: Fram medel={initial_front_dist_avg:.1f} cm, Bak medel={initial_rear_dist_avg:.1f} cm")
+
+    print("[AGV] Skickar framatkommando (b'0') till ESP32."); esp_serial_param.write(b'0')
+    movement_start_time_lidar = time.time()
+    TIMEOUT_LIDAR_MOVE = 20.0
+
+    while True:
+        if time.time() - movement_start_time_lidar > TIMEOUT_LIDAR_MOVE:
+            print("[AGV] Timeout vid Lidar-guidad framatrorelse. Skickar stopp."); esp_serial_param.write(b'9'); break
+        time.sleep(0.1)
+        current_front_dist_avg = 0; current_rear_dist_avg = 0
+        with lidar_scan_for_move_control_lock:
+            if not any(d > 0 for d in current_lidar_scan_for_move_control): print("[AGV] Lidar-data ej tillganglig under rorelse."); continue
+            current_valid_front = [current_lidar_scan_for_move_control[i] for i in front_angle_indices if current_lidar_scan_for_move_control[i] > 0]
+            current_valid_rear = [current_lidar_scan_for_move_control[i] for i in rear_angle_indices if current_lidar_scan_for_move_control[i] > 0]
+
+        if not current_valid_front or not current_valid_rear: continue
+        current_front_dist_avg = sum(current_valid_front) / len(current_valid_front)
+        current_rear_dist_avg = sum(current_valid_rear) / len(current_valid_rear)
+        dist_moved_estimate_f = initial_front_dist_avg - current_front_dist_avg
+        dist_moved_estimate_r = current_rear_dist_avg - initial_rear_dist_avg
+        valid_estimates_moved = []
+        if dist_moved_estimate_f > - (distance_to_target_cm * 0.1): valid_estimates_moved.append(dist_moved_estimate_f)
+        if dist_moved_estimate_r > - (distance_to_target_cm * 0.1): valid_estimates_moved.append(dist_moved_estimate_r)
+        
+        if not valid_estimates_moved:
+            curr_x_dwm_loop, curr_y_dwm_loop = get_position()
+            if abs(target_x_coord - curr_x_dwm_loop) < 10 and abs(target_y_coord - curr_y_dwm_loop) < 10:
+               print(f"[AGV] Nådde målet enligt DWM (fallback). Skickar stopp."); esp_serial_param.write(b'9'); break
+            continue
+        avg_dist_moved_lidar = sum(valid_estimates_moved) / len(valid_estimates_moved)
+        STOP_MARGIN_PERCENT = 0.05; OVERSHOOT_ALLOWANCE_PERCENT = 0.15
+        if avg_dist_moved_lidar >= distance_to_target_cm * (1.0 - STOP_MARGIN_PERCENT):
+            if avg_dist_moved_lidar <= distance_to_target_cm * (1.0 + OVERSHOOT_ALLOWANCE_PERCENT):
+                print(f"[AGV] Malet ({distance_to_target_cm:.1f} cm) natt (Lidar: {avg_dist_moved_lidar:.1f} cm). Stopp."); esp_serial_param.write(b'9'); break
+            else:
+                print(f"[AGV] OVERSKJUTNING (Lidar: {avg_dist_moved_lidar:.1f} cm, mal {distance_to_target_cm:.1f} cm). Stopp."); esp_serial_param.write(b'9'); break
+        curr_x_dwm_final, curr_y_dwm_final = get_position()
+        if abs(target_x_coord - curr_x_dwm_final) < 10 and abs(target_y_coord - curr_y_dwm_final) < 10:
+             print(f"[AGV] Malet natt (DWM) under Lidar-rorelse. Stopp."); esp_serial_param.write(b'9'); break
+    print(f"[AGV] Lidar-guidad framatrorelse avslutad.")
+
+# === Bluetooth Server Setup (som tidigare) ===
+server_sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+server_sock.bind(("", bluetooth.PORT_ANY))
+server_sock.listen(1)
+port = server_sock.getsockname()[1]
+print(f"[AGV] Bluetooth-server startad pa port {port}. Vantar pa anslutning...")
+
+try:
+    while True:
+        client_sock_main, client_info_main = server_sock.accept()
+        print(f"[AGV] Klient ansluten: {client_info_main}")
+        dwm_thread = threading.Thread(target=dwm_position_task, args=(client_sock_main,), daemon=True)
+        dwm_thread.start()
+        active_lidar_thread_for_client = None
+        data_buffer = ""
+        try:
+            while True: 
+                data_bytes = client_sock_main.recv(1024)
+                if not data_bytes: print(f"[AGV] Klient {client_info_main} kopplade fran."); break 
+                data_buffer += data_bytes.decode("utf-8", errors='ignore')
+                while '\n' in data_buffer:
+                    line, data_buffer = data_buffer.split('\n', 1)
+                    line = line.strip(); 
+                    if not line: continue
+                    print(f"[AGV] Mottaget fran {client_info_main}: {line}")
+                    if line.startswith("GT,"):
+                        parts = line.split(',')
+                        if len(parts) == 4:
+                            _, target_x_cmd, target_y_cmd, v_cmd = parts
+                            move_thread = threading.Thread(target=send_move_commands, args=(esp_serial, target_x_cmd, target_y_cmd, v_cmd), daemon=True)
+                            move_thread.start()
+                        else: print(f"[AGV] Ogiltigt GT-kommandoformat: {line}")
+                    elif line == "lidar":
+                        if active_lidar_thread_for_client and active_lidar_thread_for_client.is_alive():
+                            print(f"[AGV] Lidar-trad kor redan for klient {client_info_main}.")
+                        else:
+                            print(f"[AGV] Startar Lidar-trad for klient {client_info_main}.")
+                            active_lidar_thread_for_client = threading.Thread(target=lidar_task, args=(client_sock_main,), daemon=True)
+                            active_lidar_thread_for_client.start()
+                    elif line == "STOP": print("[AGV] STOP mottaget. Skickar till ESP32."); esp_serial.write(b'9')
+                    elif line == "position":
+                        current_pos_x_bt, current_pos_y_bt = get_position()
+                        client_sock_main.send(f"INFO:Position_Task_Active POS:{current_pos_x_bt},{current_pos_y_bt}\r\n".encode("utf-8"))
+        except OSError as e_os: print(f"[AGV] Anslutningsfel med klient {client_info_main}: {e_os}")
+        except Exception as e_client_loop_main: print(f"[AGV] Ovantat fel i klientkommunikationsloop for {client_info_main}: {e_client_loop_main}")
+        finally:
+            print(f"[AGV] Stanger anslutning till klient {client_info_main}.")
+            # lidar_active kan sattas till False har om det ska stoppa traden, men traden har egen logik
+            client_sock_main.close()
+        print("[AGV] Vantar pa ny anslutning...")
+except KeyboardInterrupt: print("\n[AGV] Avslutar Bluetooth-server (KeyboardInterrupt)...")
+except Exception as e_main_loop: print(f"[AGV] Allvarligt fel i huvudloop: {e_main_loop}")
+finally:
+    print("[AGV] Stanger resurser...")
+    lidar_active = False 
+    time.sleep(0.5) 
+    if 'esp_serial' in locals() and esp_serial.is_open:
+        try: esp_serial.write(b'9'); esp_serial.close(); print("[AGV] ESP seriell port stangd.")
+        except Exception as e_esp_final_close: print(f"[AGV] Fel vid stangning av ESP seriell port: {e_esp_final_close}")
+    if 'server_sock' in locals(): server_sock.close(); print("[AGV] Bluetooth-server stangd.")
+    print("[AGV] Programmet avslutat.")
