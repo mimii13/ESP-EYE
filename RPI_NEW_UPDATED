@@ -1,0 +1,410 @@
+import bluetooth
+import time
+import os
+import serial
+import struct
+import threading
+import math
+# numpy and deque are not strictly needed in this version after removing stabilization
+# from collections import deque # Not used
+
+# === RPi State ===
+current_rpi_x_m = 0.0  # Corrected X from ESP32, in meters
+current_rpi_y_m = 0.0  # Corrected Y from ESP32, in meters
+position_lock = threading.Lock()
+
+# === LIDAR KONFIGURATION ===
+LIDAR_PORT = "/dev/ttyUSB0"
+LIDAR_BAUDRATE = 460800
+CMD_LIDAR_STOP = b'\xA5\x25'
+CMD_LIDAR_SCAN = b'\xA5\x20'
+check_angles = [i for i in range(0, 360, 1)]
+lidar_active = False
+lidar_thread = None
+
+# === DWM1001 (UWB) KONFIGURATION ===
+DWM_PORT = "/dev/ttyACM0"
+DWM_BAUDRATE = 115200
+
+# === ESP32 Kommunikation ===
+ESP32_SERIAL_PORT = '/dev/ttyS0' # Matched to your original script (RPi Zero/3 uses /dev/ttyS0 for GPIO serial, RPi 4 might use /dev/ttyAMA0 or others)
+ESP32_BAUDRATE = 115200
+esp_serial = None
+
+
+def update_rpi_position(new_x_m, new_y_m):
+    global current_rpi_x_m, current_rpi_y_m
+    with position_lock:
+        current_rpi_x_m = new_x_m
+        current_rpi_y_m = new_y_m
+
+def get_rpi_position_meters():
+    with position_lock:
+        return current_rpi_x_m, current_rpi_y_m
+
+# --- ESP32 Communication Functions ---
+def send_target_to_esp32(target_x_cm, target_y_cm):
+    global esp_serial
+    if esp_serial and esp_serial.is_open:
+        # Convert target from cm (from S) to meters (for ESP32)
+        target_x_m = float(target_x_cm) / 100.0
+        target_y_m = float(target_y_cm) / 100.0
+        cmd = f"GO,{target_x_m:.3f},{target_y_m:.3f}\n"
+        try:
+            esp_serial.write(cmd.encode('utf-8'))
+            print(f"[AGV] Sent target to ESP32: X={target_x_m:.3f}m, Y={target_y_m:.3f}m")
+        except Exception as e:
+            print(f"[AGV] Error sending target to ESP32: {e}")
+    else:
+        print("[AGV] Cannot send target: ESP32 serial not available.")
+        
+def stop_agv_esp32():
+    global esp_serial
+    if esp_serial and esp_serial.is_open:
+        try:
+            esp_serial.write(b"STOP\n")
+            print("[AGV] Sent STOP command to ESP32.")
+        except Exception as e:
+            print(f"[AGV] Error sending STOP to ESP32: {e}")
+    else:
+        print("[AGV] Cannot send STOP: ESP32 serial not available.")
+
+# --- Thread Tasks ---
+def esp32_listener_task():
+    global esp_serial
+    print("[ESP Listener] Task started.")
+    while True:
+        if esp_serial and esp_serial.is_open:
+            try:
+                line = esp_serial.readline().decode("utf-8", errors='ignore').strip()
+                if line:
+                    # print(f"[ESP Listener] Received from ESP32: {line}") # Debug
+                    if line.startswith("POS,"):
+                        parts = line.split(',')
+                        if len(parts) >= 3:
+                            try:
+                                esp_x_m = float(parts[1]) # Meters
+                                esp_y_m = float(parts[2]) # Meters
+                                update_rpi_position(esp_x_m, esp_y_m)
+                                # print(f"[ESP Listener] Updated RPi pos: X={esp_x_m:.3f}m, Y={esp_y_m:.3f}m")
+                            except ValueError:
+                                print(f"[ESP Listener] Error parsing POS data from ESP32: {line}")
+                    elif "REACHED" in line:
+                        print("[ESP Listener] ESP32 reported: Target Reached!")
+                    elif line.startswith("ESP32 AGV Starting") or line.startswith("ESP32 EKF READY") or line.startswith("EKF:") or line.startswith("ESP Received DWM"):
+                        print(f"[ESP32 STATUS] {line}") # Print ESP32 debug/status messages
+            except serial.SerialException as e:
+                print(f"[ESP Listener] Serial error: {e}. ESP32 disconnected?")
+                # Attempt to close, main loop might try to reopen or re-check
+                if esp_serial:
+                    try:
+                        esp_serial.close()
+                    except:
+                        pass
+                esp_serial = None # Signal that it's closed
+                time.sleep(5) # Wait before next check (implicit via main loop's check)
+            except Exception as e:
+                print(f"[ESP Listener] Unexpected error: {e}")
+                time.sleep(1)
+        else:
+            # print("[ESP Listener] ESP32 serial not open. Waiting.")
+            time.sleep(5) # Wait for serial port to be (re)established by main logic
+            
+def dwm_reader_task():
+    global esp_serial
+    print("[DWM Reader] Task started.")
+    while True: # Outer loop for attempting to connect to DWM
+        try:
+            with serial.Serial(DWM_PORT, DWM_BAUDRATE, timeout=1) as dwm_ser:
+                print(f"[DWM Reader] Connected to DWM1001 on {DWM_PORT}")
+                # Initialize DWM1001 to output positions
+                # Send CRLF twice to enter shell mode, then 'lep' for position stream
+                dwm_ser.write(b"\r") 
+                time.sleep(0.1)
+                dwm_ser.write(b"\r")
+                time.sleep(0.2)
+                #dwm_ser.reset_input_buffer() # Clear any old data
+                
+                # Check for "dwm>" prompt to confirm shell mode
+                prompt_found = False
+                for _ in range(5): # Try for a second
+                    if dwm_ser.in_waiting:
+                        response = dwm_ser.read(dwm_ser.in_waiting).decode('utf-8', errors='ignore')
+                        if "dwm>" in response:
+                            prompt_found = True
+                            break
+                    time.sleep(0.2)
+                
+                if not prompt_found:
+                    print("[DWM Reader] Did not receive 'dwm>' prompt. Retrying DWM connection.")
+                    dwm_ser.close()
+                    time.sleep(5)
+                    continue
+
+                print("[DWM Reader] 'dwm>' prompt found. Sending 'lep' command.")
+                dwm_ser.write(b"lep\r") # Request position stream (POS,x,y,z,quality - mm)
+                time.sleep(0.2) # Allow time for stream to start
+
+                while True: # Inner loop for reading data
+                    if dwm_ser.in_waiting > 0:
+                        line = dwm_ser.readline().decode("utf-8", errors='ignore').strip()
+                        if line.startswith("POS,"):
+                            parts = line.split(',')
+                            # Expected: POS,x_mm,y_mm,z_mm,quality_factor
+                            if len(parts) >= 4: 
+                                try:
+                                    dwm_x_mm = float(parts[1])
+                                    dwm_y_mm = float(parts[2])
+                                    
+                                    # Convert mm to meters for ESP32
+                                    dwm_x_m = dwm_x_mm / 1000.0
+                                    dwm_y_m = dwm_y_mm / 1000.0
+                                    
+                                    if esp_serial and esp_serial.is_open:
+                                        esp_cmd = f"DWM,{dwm_x_m:.3f},{dwm_y_m:.3f}\n"
+                                        esp_serial.write(esp_cmd.encode('utf-8'))
+                                        # print(f"[DWM Reader] Sent to ESP32: X={dwm_x_m:.3f}m, Y={dwm_y_m:.3f}m") # Debug
+                                    else:
+                                        # print("[DWM Reader] ESP32 serial not available for sending DWM data.")
+                                        pass # Avoid printing too much if ESP is temp down
+                                except ValueError:
+                                    print(f"[DWM Reader] Error parsing DWM POS data: {line}")
+                                except IndexError:
+                                    print(f"[DWM Reader] Error parsing DWM POS data (index): {line}")
+                    time.sleep(0.05) # Adjust polling frequency as needed (e.g., 20Hz)
+        except serial.SerialException as e:
+            print(f"[DWM Reader] Serial error with DWM on {DWM_PORT}: {e}. Retrying in 5s.")
+        except Exception as e:
+            print(f"[DWM Reader] Unexpected error: {e}. Retrying in 5s.")
+        finally:
+            # Ensure port is closed if an error occurred within the 'with' block or if loop breaks
+            # The 'with' statement handles closing on normal exit or unhandled exceptions within it.
+            pass
+        time.sleep(5) # Wait before retrying DWM connection
+        
+# --- Lidar Functions (from your original script) ---
+def get_lidar_descriptor(ser_conn):
+    descriptor = ser_conn.read(7)
+    if descriptor[:2] != b'\xA5\x5A':
+        raise Exception("LIDAR: Failed to receive scan descriptor")
+
+def parse_lidar_packet(packet_data):
+    if len(packet_data) != 5: return None
+    b0, b1, b2, b3, b4 = struct.unpack('<BBBBB', packet_data)
+    start_flag = b0 & 0x01
+    inverted_start_flag = (b0 >> 1) & 0x01
+    if start_flag != (~inverted_start_flag & 0x01): return None
+    # quality = b0 >> 2 # Quality not used in original string output
+    angle_q6 = ((b2 << 7) | (b1 >> 1))
+    angle = (angle_q6 / 64.0) % 360
+    dist_q2 = (b4 << 8) | b3
+    distance_cm = round((dist_q2 / 4.0) / 10.0) # mm to cm
+    return angle, max(0, distance_cm) # Quality removed
+
+def lidar_task_thread_func(client_sock_ref):
+    global lidar_active
+    print("[LIDAR] Task started.")
+    
+    ser_lidar = None
+    try:
+        with serial.Serial(LIDAR_PORT, LIDAR_BAUDRATE, timeout=1) as ser_lidar:
+            print(f"[LIDAR] Connected to Lidar on {LIDAR_PORT}")
+            ser_lidar.write(CMD_LIDAR_STOP)
+            time.sleep(0.1)
+            ser_lidar.reset_input_buffer()
+            ser_lidar.write(CMD_LIDAR_SCAN)
+            get_lidar_descriptor(ser_lidar)
+
+            temp_array = [0] * len(check_angles)
+            current_scan_index = 0
+
+            while lidar_active:
+                packet = ser_lidar.read(5)
+                if not lidar_active: break # Check again before processing
+                if len(packet) != 5: continue
+
+                result = parse_lidar_packet(packet)
+                if result is None: continue
+
+                angle, distance_cm = result
+                angle_rounded = round(angle)
+                
+                # Original logic to fill temp_array based on target angles
+                target_angle = check_angles[current_scan_index]
+                if abs(angle_rounded - target_angle) <= 1: # Tolerance for matching angle
+                    temp_array[current_scan_index] = distance_cm # Already rounded in parse
+                    current_scan_index += 1
+                    if current_scan_index >= len(check_angles): # Full scan completed
+                        current_scan_index = 0 
+                        lidar_string = "LIDAR:" + ",".join(map(str, temp_array))
+                        try:
+                            if client_sock_ref and client_sock_ref.fileno() != -1:
+                                client_sock_ref.send((lidar_string + "\n").encode("utf-8"))
+                            else:
+                                print("[LIDAR] Bluetooth client not connected/valid, stopping Lidar.")
+                                lidar_active = False # Stop Lidar if client is gone
+                                break 
+                        except Exception as e_send:
+                            print(f"[LIDAR] Send error: {e_send}. Stopping Lidar.")
+                            lidar_active = False
+                            break
+            # End of while lidar_active
+    except serial.SerialException as e_serial:
+        print(f"[LIDAR] Serial error: {e_serial}")
+    except Exception as e_lidar:
+        print(f"[LIDAR] General error: {e_lidar}")
+    finally:
+        if ser_lidar and ser_lidar.is_open:
+            print("[LIDAR] Stopping Lidar scan (finally block).")
+            try:
+                ser_lidar.write(CMD_LIDAR_STOP)
+                time.sleep(0.1)
+            except: pass # Ignore errors during stop
+            ser_lidar.close()
+        lidar_active = False # Ensure flag is false on exit
+        print("[LIDAR] Task finished.")
+        
+# === Main Application ===
+def main():
+    global esp_serial, lidar_active, lidar_thread
+    
+    # Attempt to connect to ESP32
+    try:
+        esp_serial = serial.Serial(ESP32_SERIAL_PORT, ESP32_BAUDRATE, timeout=1)
+        print(f"[AGV] Connected to ESP32 on {ESP32_SERIAL_PORT}")
+    except serial.SerialException as e:
+        print(f"[AGV] ERROR: Could not open serial port to ESP32: {e}")
+        print("[AGV] ESP32 dependent features will not work.")
+        esp_serial = None # Ensure it's None if connection failed
+
+    # Start background tasks
+    listener = threading.Thread(target=esp32_listener_task, daemon=True)
+    listener.start()
+
+    dwm_reader = threading.Thread(target=dwm_reader_task, daemon=True)
+    dwm_reader.start()
+
+    # Bluetooth Server Setup
+    server_sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+    server_sock.bind(("", bluetooth.PORT_ANY))
+    server_sock.listen(1)
+    port = server_sock.getsockname()[1]
+    print(f"[BT Server] Bluetooth server started on RFCOMM port {port}.")
+    print("[BT Server] Waiting for client connection...")
+
+    COMMAND_FILE = "command_log.txt" # For logging commands if needed
+    
+    try:
+        while True:
+            client_sock, client_info = server_sock.accept()
+            print(f"[BT Server] Client connected: {client_info}")
+            client_owns_lidar = False # Track if this client started lidar
+
+            try:
+                while True:
+                    data_bytes = client_sock.recv(1024)
+                    if not data_bytes:
+                        print("[BT Server] Client disconnected (no data).")
+                        break
+                        
+                    # Handle multiple commands in one recv
+                    commands_raw = data_bytes.decode("utf-8", errors='ignore')
+                    for command in commands_raw.strip().splitlines():
+                        command = command.strip()
+                        if not command: continue
+
+                        print(f"[BT Server] Received from {client_info}: {command}")
+
+                        if command.startswith("GT,"): # Target: GT,x_cm,y_cm
+                            parts = command.replace("GT,", "").split(",")
+                            if len(parts) >= 2:
+                                try:
+                                    target_x_cm = float(parts[0])
+                                    target_y_cm = float(parts[1])
+                                    # Angle (V) from original command is ignored here
+                                    send_target_to_esp32(target_x_cm, target_y_cm)
+                                    client_sock.send("CMD:GT OK\n".encode("utf-8"))
+                                    with open(COMMAND_FILE, "a") as f: # Log command
+                                        f.write(f"{time.ctime()}: {command}\n")
+                                except ValueError:
+                                    client_sock.send("CMD:GT ERROR - Bad format\n".encode("utf-8"))
+                            else:
+                                client_sock.send("CMD:GT ERROR - Missing params\n".encode("utf-8"))
+                        
+                        elif command == "position": # Request for position
+                            pos_x_m, pos_y_m = get_rpi_position_meters()
+                            # Convert meters to cm for client, 1 decimal place
+                            pos_x_cm_str = f"{pos_x_m * 100.0:.1f}"
+                            pos_y_cm_str = f"{pos_y_m * 100.0:.1f}"
+                            response = f"POS:{pos_x_cm_str},{pos_y_cm_str}\n"
+                            client_sock.send(response.encode("utf-8"))
+
+                        elif command == "STOP_AGV": # Command to stop the AGV
+                            stop_agv_esp32()
+                            client_sock.send("CMD:STOP_AGV OK\n".encode("utf-8"))
+                            
+                        elif command == "lidar": # Start Lidar stream
+                            if lidar_thread and lidar_thread.is_alive():
+                                print("[BT Server] Lidar already running. Sending OK.")
+                                client_sock.send("CMD:lidar INFO - Already running\n".encode("utf-8"))
+                            else:
+                                print("[BT Server] Starting Lidar stream...")
+                                lidar_active = True
+                                client_owns_lidar = True
+                                lidar_thread = threading.Thread(target=lidar_task_thread_func, args=(client_sock,), daemon=True)
+                                lidar_thread.start()
+                                client_sock.send("CMD:lidar START OK\n".encode("utf-8"))
+                        
+                        elif command == "STOP_LIDAR":
+                            if lidar_thread and lidar_thread.is_alive():
+                                print("[BT Server] Stopping Lidar stream...")
+                                lidar_active = False # Signal thread to stop
+                                lidar_thread.join(timeout=2.0) # Wait for it to finish
+                                if lidar_thread.is_alive():
+                                    client_sock.send("CMD:STOP_LIDAR WARN - Timeout stopping\n".encode("utf-8"))
+                                else:
+                                    client_sock.send("CMD:STOP_LIDAR OK\n".encode("utf-8"))
+                                lidar_thread = None # Clear thread object
+                            else:
+                                client_sock.send("CMD:STOP_LIDAR INFO - Not running\n".encode("utf-8"))
+                            client_owns_lidar = False # Client no longer owns lidar
+                            
+                        else:
+                            client_sock.send("CMD:UNKNOWN\n".encode("utf-8"))
+            
+            except bluetooth.btcommon.BluetoothError as bt_err:
+                print(f"[BT Server] Bluetooth error with client {client_info}: {bt_err}")
+            except Exception as e_client:
+                print(f"[BT Server] Unexpected error with client {client_info}: {e_client}")
+            finally:
+                print(f"[BT Server] Cleaning up client connection {client_info}.")
+                if client_owns_lidar and lidar_thread and lidar_thread.is_alive():
+                    print("[BT Server] Client disconnected, stopping Lidar stream initiated by this client.")
+                    lidar_active = False
+                    lidar_thread.join(timeout=1.0)
+                    lidar_thread = None
+                try:
+                    client_sock.close()
+                except: pass
+                print(f"[BT Server] Connection to {client_info} closed. Waiting for new client...")
+
+    except KeyboardInterrupt:
+        print("\n[AGV] KeyboardInterrupt: Shutting down...")
+    except Exception as e_main:
+        print(f"[AGV] Main loop unexpected error: {e_main}")
+    finally:
+        print("[AGV] Final cleanup...")
+        if lidar_thread and lidar_thread.is_alive():
+            print("[AGV] Stopping Lidar thread...")
+            lidar_active = False
+            lidar_thread.join(timeout=2.0)
+        if server_sock:
+            try: server_sock.close()
+            except: pass
+        if esp_serial and esp_serial.is_open:
+            try: esp_serial.close()
+            except: pass
+        print("[AGV] Shutdown complete.")
+
+if __name__ == "__main__":
+    main()
