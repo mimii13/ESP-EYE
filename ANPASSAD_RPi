@@ -1,411 +1,460 @@
-# AGV Raspberry Pi-huvudkod:
-# - Bluetooth-server för överordnat system (t.ex. mobil/dator)
-# - Tar emot och skickar mål till ESP32
-# - Tar emot och visar position samt "REACHED" från ESP32
-# - Skickar "TARGET_REACHED" till Bluetooth-klient vid bekräftelse från ESP32
-# - Startar Lidar-task på kommando, skickar Lidar-data till klient
-# - All logik och trådning är kommenterad
-
-import bluetooth  # För Bluetooth RFCOMM-server
+import bluetooth
 import time
-import serial     # För UART (ESP32)
-import struct     # För tolkning av Lidar-paket
-import threading  # För att lyssna på position och köra Lidar parallellt
-from collections import deque # Not actively used in this version, but was in original
+import os
+import serial
+import struct
+import threading
+import math
+import numpy as np
+from collections import deque
 
-# -- AGV-position, mutex för trådning --
+# === CONFIGURATION ===
 position_lock = threading.Lock()
-current_agv_x, current_agv_y = 475.0, 190.0  # Startvärde, uppdateras från ESP32
-lidar_active = False # Flag to control the lidar scanning loop
+# position_buffer_x = deque(maxlen=5) # Not used in provided snippet for this logic
+# position_buffer_y = deque(maxlen=5) # Not used
+# JUMP_THRESHOLD = 30 # Not used
+# SMOOTHING_FACTOR = 0.2 # Not used
+x_global, y_global = 80.0, 200.0 # Renamed to avoid conflict with local x, y in dwm_task
+lidar_active = False
+LIDAR_PORT = "/dev/ttyUSB0"
+LIDAR_BAUDRATE = 460800
+CMD_STOP = b'\xA5\x25'
+CMD_SCAN = b'\xA5\x20'
+check_angles = [i for i in range(0, 360, 1)]
+esp_serial = serial.Serial('/dev/ttyS0', 115200, timeout=1)
 
-# -- Lidar-inställningar --
-LIDAR_PORT = "/dev/ttyUSB0"     # RPLidar C1 device (eller annan Lidar)
-LIDAR_BAUDRATE = 460800         # Lidar baudrate (kan variera beroende på Lidar-modell)
-CMD_LIDAR_STOP = b'\xA5\x25'    # Stoppkommando för RPLidar
-CMD_LIDAR_SCAN = b'\xA5\x20'    # Start scan-kommando för RPLidar
-# check_angles = [i for i in range(0, 360, 1)] # 0-359 grader, 1 grad steg (används i lidar_task)
+# === Kalman Filter Configuration ===
+kalman_x_state = { # Renamed to avoid conflict with global x
+    'x': 80.0,
+    'v': 0.0,
+    'P': np.array([[15, 5], [5, 15]], dtype=np.float32)
+}
+kalman_y_state = { # Renamed to avoid conflict with global y
+    'x': 200.0,
+    'v': 0.0,
+    'P': np.array([[15, 5], [5, 15]], dtype=np.float32)
+}
+# Q_global = np.array([[0.5, 0.1], [0.3, 0.2]]) # Defined inside kalman_update or can be passed
+# R_base_global = 5.0 # Defined inside kalman_update
+# speed_factor_global = 1.5 # Defined inside kalman_update
+# dt_global = 0.1 # This will now be dynamic
 
-# -- Seriell anslutning till ESP32 --
-# !!! VIKTIGT: Se till att denna port matchar den faktiska anslutningen till ESP32 !!!
-# Om du använder USB-till-seriell adapter kan det vara /dev/ttyUSB1, /dev/ttyACM0 etc.
-# Standard GPIO UART på Pi är oftast /dev/ttyS0 (Pi 3/4/Zero W) eller /dev/ttyAMA0 (äldre Pi)
-# Se till att seriell konsol är avstängd på denna port i raspi-config om du använder GPIO UART.
-ESP32_SERIAL_PORT = '/dev/ttyS0' # Exempel, anpassa efter din setup
-ESP32_BAUDRATE = 115200
-esp_serial = None # Kommer initialiseras i main
+# kalman_update function now accepts dt as an argument
+def kalman_update(kalman_state, acc, dt_actual, measurement=None): # dt_actual is now a parameter
+    # Dynamic Q based on speed
+    def calculate_dynamic_Q(speed):
+        factor = max(1, abs(speed) / 10) # Use abs(speed)
+        # Example: Q for process noise - adjust these values based on testing
+        # If accelerometer is good, these can be smaller. If model is less certain, larger.
+        return np.array([[0.1 * factor, 0], [0, 0.2 * factor]]) # Adjusted example Q
 
-# --- Global för aktiv Bluetooth-klient socket och dess lås ---
-active_client_sock_lock = threading.Lock()
-active_client_sock = None
+    # Dynamic R based on speed
+    def calculate_dynamic_R(speed):
+        R_base = 10.0 # How much you trust DWM. Smaller = more trust.
+        # speed_factor = 1.0 # This logic can be simplified or adjusted
+        # Original: max(R_base / max(speed, 1), 5.0)
+        # If speed is 0, R becomes R_base. If speed is high, R decreases.
+        # Let's ensure R doesn't become too small. Minimum R could be e.g. 5.0
+        return max(R_base / max(abs(speed), 1.0), 5.0) # Use abs(speed), ensure min R
 
-def connect_esp32():
-    """Försöker ansluta till ESP32 via seriell port."""
-    global esp_serial
-    try:
-        esp_serial = serial.Serial(ESP32_SERIAL_PORT, ESP32_BAUDRATE, timeout=1)
-        print(f"[AGV] Ansluten till ESP32 på {ESP32_SERIAL_PORT}")
-        return True
-    except serial.SerialException as e:
-        print(f"[AGV] Kunde inte ansluta till ESP32 på {ESP32_SERIAL_PORT}: {e}")
-        esp_serial = None
-        return False
+    A = np.array([[1, dt_actual], [0, 1]]) # Use dt_actual
+    B = np.array([[0.5 * dt_actual**2], [dt_actual]]) # Use dt_actual
+    current_x_matrix = np.array([[kalman_state['x']], [kalman_state['v']]]) # Renamed local x to avoid confusion
+    u = np.array([[acc]])
 
-def update_agv_position(new_x, new_y):
-    """Säker trådad uppdatering av AGV-position."""
-    global current_agv_x, current_agv_y
+    # Calculate dynamic Q
+    current_speed = kalman_state['v'] # Already absolute if v is always positive, or use abs()
+    dynamic_Q = calculate_dynamic_Q(current_speed)
+
+    x_pred = A @ current_x_matrix + B @ u
+    P_pred = A @ kalman_state['P'] @ A.T + dynamic_Q
+
+    # Dynamic R
+    dynamic_R = calculate_dynamic_R(current_speed)
+
+    # Update
+    if measurement is not None:
+        H = np.array([[1, 0]])
+        z = np.array([[measurement]])
+        y_residual = z - H @ x_pred # Renamed y to y_residual
+        S = H @ P_pred @ H.T + dynamic_R
+        
+        # Avoid singular matrix for S inverse
+        if np.linalg.det(S) == 0: # Check if S is singular
+             K = P_pred @ H.T @ np.linalg.pinv(S) # Use pseudo-inverse if singular
+        else:
+             K = P_pred @ H.T @ np.linalg.inv(S)
+
+
+        # Adjust Kalman Gain at high speed (optional, can be removed if causing issues)
+        if abs(current_speed) > 5: # Use abs(current_speed)
+            K = K * 1.2 # Reduced factor, tune or remove
+
+        x_new_state = x_pred + K @ y_residual # Renamed x_new to x_new_state
+        P_new = (np.eye(2) - K @ H) @ P_pred
+    else:
+        x_new_state = x_pred
+        P_new = P_pred
+
+    kalman_state['x'] = x_new_state[0, 0]
+    kalman_state['v'] = x_new_state[1, 0]
+    kalman_state['P'] = P_new
+
+    return kalman_state['x']
+    
+def get_descriptor(ser):
+    descriptor = ser.read(7)
+    if len(descriptor) < 7 or descriptor[:2] != b'\xA5\x5A': # Check length too
+        raise Exception("Failed to receive scan descriptor")
+
+def update_position(new_x, new_y):
+    global x_global, y_global
     with position_lock:
-        current_agv_x, current_agv_y = new_x, new_y
+        x_global, y_global = new_x, new_y
 
-def get_agv_position():
-    """Hämta aktuell AGV-position, trådsäkert."""
-    global current_agv_x, current_agv_y
+def get_position():
+    global x_global, y_global
     with position_lock:
-        return current_agv_x, current_agv_y
+        return x_global, y_global
 
-def parse_lidar_packet(packet_data):
-    """Tolka 5-byte Lidar-paket till (vinkel, avstånd, kvalitet). Anpassad för RPLidar."""
-    if len(packet_data) != 5:
+def parse_packet(packet):
+    if len(packet) != 5:
         return None
-    # RPLidar paketstruktur (kan variera lite mellan modeller/firmware)
-    # Byte 0: S (Start Bit, alltid 1), S! (Inverterad Start Bit, alltid 0), Kvalitet (6 bitar)
-    # Byte 1: Vinkel LSB (7 bitar), C (Check Bit, alltid 1)
-    # Byte 2: Vinkel MSB (8 bitar)
-    # Byte 3: Avstånd LSB (8 bitar)
-    # Byte 4: Avstånd MSB (8 bitar)
-    b0, b1, b2, b3, b4 = struct.unpack('<BBBBB', packet_data)
-
-    quality = b0 >> 2
-    angle_q6 = ((b2 << 7) | (b1 >> 1)) # Kombinera vinkelbitar
-    angle_degrees = angle_q6 / 64.0    # Konvertera från Q6-format till grader
-
-    distance_q2 = (b4 << 8) | b3       # Kombinera avståndsbitar
-    distance_mm = distance_q2 / 4.0    # Konvertera från Q2-format till mm (för RPLidar)
-                                       # Vissa Lidars kan ge cm direkt eller behöva annan skalning
-
-    # Start bit check (S=1, S!=0)
+    b0, b1, b2, b3, b4 = struct.unpack('<BBBBB', packet)
     start_flag = b0 & 0x01
     inverted_start_flag = (b0 >> 1) & 0x01
-    if not (start_flag == 1 and inverted_start_flag == 0):
-        # print(f"Lidar packet start bit error: S={start_flag}, S!={inverted_start_flag}")
+    if start_flag != (~inverted_start_flag & 0x01): # Original check, ensure it's correct
         return None
-    # Check bit (C=1)
-    # check_bit = b1 & 0x01
-    # if not (check_bit == 1):
-    #     print(f"Lidar packet check bit error: C={check_bit}")
-    #     return None
+    quality = b0 >> 2
+    angle_q6 = ((b2 << 7) | (b1 >> 1))
+    angle = (angle_q6 / 64.0) % 360
+    dist_q2 = (b4 << 8) | b3
+    distance_cm = round((dist_q2 / 4.0) / 10.0) # mm to cm
+    return angle, max(0, distance_cm), quality
 
-    return angle_degrees % 360, max(0, distance_mm), quality
-
-
-def get_lidar_scan_descriptor(ser_conn):
-    """Väntar på och validerar Lidar scan descriptor (7 bytes för RPLidar)."""
-    descriptor = ser_conn.read(7)
-    if len(descriptor) < 7 or descriptor[:2] != b'\xA5\x5A': # Startflaggor för RPLidar descriptor
-        print("[AGV] Misslyckades med att ta emot Lidar scan descriptor eller felaktig descriptor.")
-        raise Exception("Misslyckades med att ta emot Lidar scan descriptor")
-    print("[AGV] Lidar scan descriptor mottagen.")
-
-
-def lidar_task_function():
-    """Lidar-task: läser ett varv (eller kontinuerligt), skickar LIDAR:... till Bluetooth-klient."""
-    global lidar_active, active_client_sock
-    
-    if not lidar_active: # Dubbelkolla om den ska starta
-        print("[AGV_LIDAR] Lidar task anropad men lidar_active är False.")
-        return
-
-    print("[AGV_LIDAR] Lidar task startar...")
-    
-    local_lidar_ser = None
+def lidar_task(client_sock):
+    global lidar_active
+    print("[AGV] LIDAR task started.")
+    lidar_active = True
+    ser_lidar = None # Define ser_lidar to ensure it's available in finally
     try:
-        local_lidar_ser = serial.Serial(LIDAR_PORT, LIDAR_BAUDRATE, timeout=1)
-        print(f"[AGV_LIDAR] Ansluten till Lidar på {LIDAR_PORT}.")
+        with serial.Serial(LIDAR_PORT, LIDAR_BAUDRATE, timeout=1) as ser_lidar:
+            ser_lidar.write(CMD_STOP)
+            time.sleep(0.1)
+            ser_lidar.reset_input_buffer()
+            ser_lidar.write(CMD_SCAN)
+            get_descriptor(ser_lidar)
+            temp_array = [0] * len(check_angles)
+            current_index = 0
+            while lidar_active:
+                packet = ser_lidar.read(5)
+                if not lidar_active: break # Check again after read
+                if len(packet) != 5:
+                    continue
+                result = parse_packet(packet)
+                if result is None:
+                    continue
+                angle, distance_cm, _ = result # Quality not used here
+                angle_rounded = round(angle)
+                target_angle = check_angles[current_index] # Assuming angles come in order
+                if abs(angle_rounded - target_angle) <= 1: # Allow small deviation
+                    temp_array[current_index] = round(distance_cm, 1)
+                    current_index += 1
+                    if current_index >= len(check_angles):
+                        current_index = 0
+                        lidar_string = "LIDAR:" + ",".join(map(str, temp_array))
+                        try:
+                            client_sock.sendall((lidar_string + "\n").encode("utf-8")) # Use sendall
+                        except Exception as send_e:
+                            print(f"[AGV] LIDAR send error: {send_e}")
+                            lidar_active = False # Stop on send error
+                            break 
+    except serial.SerialException as e:
+        print(f"[AGV] LIDAR Serial Error: {e}")
+    except Exception as e:
+        if lidar_active: # Only print if not an intentional stop
+            print(f"[AGV] LIDAR exception: {e}")
+    finally:
+        if ser_lidar and ser_lidar.is_open:
+            try:
+                ser_lidar.write(CMD_STOP)
+                time.sleep(0.1)
+                ser_lidar.close() # Ensure close is called
+            except Exception as e_close:
+                print(f"[AGV] Exception closing LIDAR: {e_close}")
+        lidar_active = False
+        print("[AGV] LIDAR task finished.")
 
-        local_lidar_ser.write(CMD_LIDAR_STOP) # Stoppa eventuell tidigare scan
-        time.sleep(0.2) # Ge Lidar tid att reagera
-        local_lidar_ser.reset_input_buffer() # Rensa buffer
-        
-        local_lidar_ser.write(CMD_LIDAR_SCAN) # Starta ny scan
-        print("[AGV_LIDAR] Scan-kommando skickat till Lidar.")
-        
-        get_lidar_scan_descriptor(local_lidar_ser) # Vänta på descriptor
 
-        # För att samla ett helt varv (360 grader)
-        # Detta är en förenklad version. Robust implementering hanterar paket som kommer oordnat,
-        # och kan behöva interpolera för saknade vinklar.
-        scan_data = [0.0] * 360 # Array för att lagra avstånd för varje grad
-        points_collected_in_scan = 0
+def dwm_position_task(client_sock):
+    # global x_global, y_global # Already global, no need to redeclare unless assigning
+    ax, ay = 0.0, 0.0
+    
+    # --- Fix for dt: Initialize last_update_time before the loop ---
+    last_kalman_filter_update_time = time.time()
 
-        while lidar_active: # Loopa så länge flaggan är satt
-            packet = local_lidar_ser.read(5) # Läs ett Lidar-datapaket (5 bytes)
-            if not lidar_active: break # Avbryt om flaggan ändrats under läsning
+    try:
+        # Corrected DWM initialization sequence
+        with serial.Serial("/dev/ttyACM0", 115200, timeout=1) as ser_dwm: # Renamed ser to ser_dwm
+            ser_dwm.reset_input_buffer()
+            ser_dwm.write(b"\r\r") # Send two carriage returns to wake up/ensure in shell
+            time.sleep(0.2)
+            ser_dwm.reset_input_buffer() # Clear any initial messages
             
-            if len(packet) == 5:
-                result = parse_lidar_packet(packet)
-                if result:
-                    angle, distance_mm, quality = result
-                    angle_int = int(round(angle)) # Runda till närmaste heltal för indexering
-                    
-                    if 0 <= angle_int < 360:
-                        scan_data[angle_int] = round(distance_mm / 10.0, 1) # Konvertera mm till cm, en decimal
-                        points_collected_in_scan +=1
+            # Try sending "lec" to get continuous position reports
+            # If "lep" is preferred, ensure "lec" is not also sent or is quit first.
+            ser_dwm.write(b"lec\r") 
+            time.sleep(0.2) # Give it time to process
+            # It's good practice to read back any response to confirm "lec" was accepted
+            # For now, assuming "lec" works and starts continuous output.
+            
+            print("[AGV] DWM positioning started (using 'lec').")
 
-                    # Skicka data efter ett fullt varv (eller ett visst antal punkter)
-                    # Här skickar vi när vi har samlat 360 unika vinkelpunkter (förenkling)
-                    # En mer robust metod skulle titta på startflaggor i Lidar-datan för att detektera nytt varv.
-                    if points_collected_in_scan >= 360: # Förenklad varvdetektering
-                        lidar_string = "LIDAR:" + ",".join(map(str, scan_data))
-                        with active_client_sock_lock:
-                            if active_client_sock:
-                                try:
-                                    active_client_sock.send((lidar_string + "\n").encode("utf-8"))
-                                    # print("[AGV_LIDAR] Skickade Lidar-scan till klient.")
-                                except Exception as e:
-                                    print(f"[AGV_LIDAR] Fel vid skickning av Lidar-data: {e}")
-                        scan_data = [0.0] * 360 # Återställ för nästa varv
-                        points_collected_in_scan = 0
-            else:
-                # Timeout eller ofullständigt paket
-                pass
-                # print("[AGV_LIDAR] Timeout vid läsning från Lidar eller ofullständigt paket.")
+            while True:
+                # --- Fix for dt: Calculate dt_actual at the start of the loop ---
+                current_time = time.time()
+                dt_actual = current_time - last_kalman_filter_update_time
+                last_kalman_filter_update_time = current_time
+
+                # Prevent dt_actual from being zero or too small
+                if dt_actual < 0.001:  # Minimum 1ms
+                    dt_actual = 0.001 
+                elif dt_actual > 0.5: # Cap dt to prevent instability if there's a long pause
+                    print(f"[Kalman] Warning: Long dt_actual: {dt_actual:.3f}s. Capping to 0.5s.")
+                    dt_actual = 0.5
+
+
+                if esp_serial.in_waiting:
+                    esp_line = esp_serial.readline().decode("utf-8", errors='ignore').strip() # Added utf-8 and ignore
+                    if esp_line.startswith("mpu:"):
+                        try:
+                            parts = esp_line.replace("mpu:", "").split(",")
+                            # Corrected MPU parsing:
+                            if len(parts) >= 2: # Expecting at least ax, ay
+                                ax = float(parts[0].strip()) # parts[0] is ax
+                                ay = float(parts[1].strip()) # parts[1] is ay
+                            # else:
+                                # print(f"[Kalman] MPU data incomplete: {esp_line}")
+                        except ValueError as e:
+                            print(f"[Kalman] Value error parsing MPU: {e} from line: {esp_line}")
+                        except Exception as e:
+                            print(f"[Kalman] General error parsing MPU: {e} from line: {esp_line}")
+                
+                raw_x_dwm = None # Initialize to None for this iteration
+                raw_y_dwm = None
+
+                if ser_dwm.in_waiting:
+                    line = ser_dwm.readline().decode("utf-8", errors='ignore').strip()
+                    # Example DWM output: "POS,0,3.56,7.21,0.89,89" (id,x,y,z,quality)
+                    # Adjust parsing based on your DWM module's exact output for "lec"
+                    if line.startswith("POS,") or "POS" in line: # More robust check
+                        parts = line.split(",")
+                        # Assuming X is parts[2] and Y is parts[3] if ID is parts[1]
+                        # Or X is parts[1] and Y is parts[2] if no ID after POS,
+                        # This depends on your DWM output format.
+                        # For "POS,id,X,Y,Z,Q", X is parts[2], Y is parts[3]
+                        # For "POS,X,Y,Z,Q", X is parts[1], Y is parts[2]
+                        # Let's assume "POS,id,X,Y,Z,Q" or similar with at least 4 useful parts after POS
+                        if len(parts) >= 4: # e.g. POS,id,x,y (or POS,x,y,z)
+                            try:
+                                # Adjust indices based on your DWM's output!
+                                # If ID is present: parts[1] is ID, parts[2] is X, parts[3] is Y
+                                # If no ID: parts[1] is X, parts[2] is Y
+                                # Assuming ID is present for now as an example:
+                                raw_x_dwm = float(parts[2]) * 100.0 # m to cm
+                                raw_y_dwm = float(parts[3]) * 100.0 # m to cm
+                            except ValueError as e:
+                                print(f"[Kalman] Value error DWM parsing: {e} from line: {line}")
+                                raw_x_dwm = None # Ensure it's None on error
+                                raw_y_dwm = None
+                            except IndexError as e:
+                                print(f"[Kalman] Index error DWM parsing: {e} from line: {line}")
+                                raw_x_dwm = None
+                                raw_y_dwm = None
+                
+                # Only update Kalman if we have a DWM measurement for this cycle
+                if raw_x_dwm is not None and raw_y_dwm is not None:
+                    # Pass dt_actual to kalman_update
+                    x_filtered = kalman_update(kalman_x_state, ax, dt_actual, raw_x_dwm)
+                    y_filtered = kalman_update(kalman_y_state, ay, dt_actual, raw_y_dwm)
+                    
+                    current_pos_x, current_pos_y = round(x_filtered, 1), round(y_filtered, 1)
+                    update_position(current_pos_x, current_pos_y)
+                    try:
+                        client_sock.sendall(f"POS:{current_pos_x},{current_pos_y}\r\n".encode("utf-8")) # Use sendall
+                    except Exception as send_e:
+                        print(f"[AGV] DWM send error: {send_e}")
+                        break # Exit loop if client connection fails
+                else:
+                    # No new DWM measurement, predict only (Kalman without measurement)
+                    x_filtered = kalman_update(kalman_x_state, ax, dt_actual, None)
+                    y_filtered = kalman_update(kalman_y_state, ay, dt_actual, None)
+                    current_pos_x, current_pos_y = round(x_filtered, 1), round(y_filtered, 1)
+                    update_position(current_pos_x, current_pos_y)
+                    # Optionally send predicted position too, or only send on DWM update
+                    try:
+                        client_sock.sendall(f"POS:{current_pos_x},{current_pos_y}\r\n".encode("utf-8"))
+                    except Exception as send_e:
+                        print(f"[AGV] DWM (predict) send error: {send_e}")
+                        break
+
 
     except serial.SerialException as e:
-        print(f"[AGV_LIDAR] Seriell fel med Lidar ({LIDAR_PORT}): {e}")
+        print(f"[AGV] DWM SerialException: {e}")
     except Exception as e:
-        print(f"[AGV_LIDAR] Oväntat fel i Lidar-task: {e}")
+        print(f"[AGV] DWM general exception: {e} (Line: {e.__traceback__.tb_lineno if e.__traceback__ else 'N/A'})")
     finally:
-        if local_lidar_ser and local_lidar_ser.is_open:
-            try:
-                local_lidar_ser.write(CMD_LIDAR_STOP) # Försök stoppa Lidar
-                time.sleep(0.1)
-                local_lidar_ser.close()
-                print("[AGV_LIDAR] Lidar-anslutning stängd.")
-            except Exception as e:
-                print(f"[AGV_LIDAR] Fel vid stängning av Lidar: {e}")
-        lidar_active = False # Se till att flaggan är falsk när tasken avslutas
-        print("[AGV_LIDAR] Lidar task avslutad.")
+        print("[AGV] DWM position task finished.")
 
 
-def send_target_to_esp32(x_coord, y_coord):
-    """Skicka målkoordinat till ESP32 via UART."""
-    global esp_serial
-    if esp_serial and esp_serial.is_open:
-        cmd = f"GO,{x_coord},{y_coord}\n"
-        try:
-            esp_serial.write(cmd.encode())
-            print(f"[AGV] Skickade GO-kommando till ESP32: X={x_coord}, Y={y_coord}")
-        except Exception as e:
-            print(f"[AGV] Fel vid skickning av GO-kommando till ESP32: {e}")
-    else:
-        print("[AGV] Kan inte skicka GO-kommando, ingen anslutning till ESP32.")
-
-def send_stop_to_esp32():
-    """Skicka STOP till ESP32."""
-    global esp_serial
-    if esp_serial and esp_serial.is_open:
-        try:
-            esp_serial.write(b"STOP\n")
-            print("[AGV] Skickade STOP-kommando till ESP32.")
-        except Exception as e:
-            print(f"[AGV] Fel vid skickning av STOP-kommando till ESP32: {e}")
-    else:
-        print("[AGV] Kan inte skicka STOP-kommando, ingen anslutning till ESP32.")
-
-def listen_for_esp32_messages():
-    """Tråd: lyssnar på ESP32, uppdaterar position och hanterar "REACHED"."""
-    global active_client_sock, esp_serial
-    
-    while True:
-        if not (esp_serial and esp_serial.is_open):
-            print("[ESP_LISTENER] Väntar på ESP32-anslutning...")
-            if not connect_esp32(): # Försök återansluta
-                time.sleep(5) # Vänta innan nytt försök
-                continue # Gå till början av while-loopen
-        
-        try:
-            if esp_serial.in_waiting > 0:
-                line = esp_serial.readline().decode("utf-8", errors='ignore').strip()
-                if not line:
-                    continue
-
-                # print(f"[ESP32_MSG_RAW] '{line}'") # För rå-debug av ESP32-meddelanden
-
-                if line.startswith("POS,"):
-                    parts = line.split(",")
-                    if len(parts) >= 3:
-                        try:
-                            px = float(parts[1])
-                            py = float(parts[2])
-                            update_agv_position(px, py)
-                            # print(f"[AGV] Position från ESP32: x={px:.2f}, y={py:.2f}")
-                        except ValueError:
-                            print(f"[AGV] Fel vid tolkning av position från ESP32 (ValueError): '{line}'")
-                elif "REACHED" in line:
-                    print("[AGV] 'REACHED' meddelande mottaget från ESP32!")
-                    with active_client_sock_lock:
-                        if active_client_sock:
-                            try:
-                                active_client_sock.send("TARGET_REACHED\n".encode("utf-8"))
-                                print("[AGV] Skickade 'TARGET_REACHED' till Bluetooth-klient.")
-                            except Exception as e:
-                                print(f"[AGV] Fel vid skickning av 'TARGET_REACHED' till klient: {e}")
-                # Annat meddelande från ESP32 kan loggas här om nödvändigt
-                # elif line.startswith("Yaw:"): # Om ESP32 skickar debug-utskrifter
-                #    print(f"[ESP32_DEBUG] {line}")
-
-
-            else: # Ingen data väntar
-                time.sleep(0.02) # Kort paus för att inte överbelasta CPU
-
-        except serial.SerialException as e:
-            print(f"[ESP_LISTENER] Seriell kommunikationsfel med ESP32: {e}")
-            if esp_serial and esp_serial.is_open:
-                esp_serial.close()
-            esp_serial = None # Markera som frånkopplad
-            time.sleep(3) # Vänta lite innan återanslutningsförsök
-        except Exception as e:
-            print(f"[ESP_LISTENER] Oväntat fel i listen_for_esp32_messages: {e}")
-            time.sleep(1) # Kort paus innan nästa försök
-
-def main_bluetooth_server():
-    """Huvudfunktion: startar Bluetooth-server, hanterar klienter och kommandon."""
-    global active_client_sock, lidar_active, esp_serial
-
-    if not connect_esp32():
-        print("[AGV] Kunde inte starta ESP32-anslutning. Avslutar kanske inte, men funktionalitet begränsad.")
-        # Du kan välja att avsluta här om ESP32-anslutning är kritisk från start
-        # return
-
-    # Starta tråden som lyssnar på meddelanden från ESP32
-    esp_listener_thread = threading.Thread(target=listen_for_esp32_messages, daemon=True)
-    esp_listener_thread.start()
-
-    server_sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+def send_move_commands(esp_serial_conn, target_x_str, target_y_str, angle_str): # Renamed esp_serial
     try:
-        server_sock.bind(("", bluetooth.PORT_ANY)) # Bind till alla adresser, slumpmässig ledig RFCOMM-port
-        server_sock.listen(1) # Tillåt en väntande anslutning
-        port = server_sock.getsockname()[1]
+        target_x = float(target_x_str)
+        target_y = float(target_y_str)
+        angle = float(angle_str)
+    except ValueError as e:
+        print(f"[AGV] Error converting coordinates: {e}")
+        return
+
+    # Send rotation command first
+    command_to_send = b''
+    if angle == 0: command_to_send = b'0' # Assuming '0' is forward, not no rotation
+    elif angle == 45: command_to_send = b'2'
+    elif angle == 90: command_to_send = b'3'
+    elif angle == 135: command_to_send = b'4'
+    elif angle == 180 or angle == -180: command_to_send = b'5'
+    elif angle == -45: command_to_send = b'6'
+    elif angle == -90: command_to_send = b'7'
+    elif angle == -135: command_to_send = b'8'
+    else:
+        print(f"[AGV] Unknown angle {angle}, not sending rotation command.")
+        # If angle 0 means no rotation, then handle forward separately
+        # For now, assuming angle 0 is a specific command if needed, or handled by ESP if '0' means forward.
+
+    if command_to_send and command_to_send != b'0': # If it's a rotation command
+        print(f"[AGV] Sending rotation command: {command_to_send.decode()} for angle {angle}")
+        esp_serial_conn.write(command_to_send)
+        # Non-blocking: Pi should not sleep here. ESP will handle rotation duration.
+        # Pi will rely on ESP to signal completion or just proceed after a short safety delay if needed.
+        # For now, no sleep, assuming ESP is non-blocking.
+        time.sleep(0.1) # Very short delay to ensure command is sent/processed by ESP before next
+    
+    print(f"[AGV] Sending command 'Forward' (0) towards X:{target_x}, Y:{target_y}")
+    esp_serial_conn.write(b'0') # Command to move forward
+
+    # Loop to check distance to target
+    # This loop needs to be robust.
+    DRIVE_STOP_THRESHOLD_CM = 15.0 # Increased threshold slightly
+    MAX_DRIVE_ATTEMPTS = 200 # Approx 20 seconds if loop is 0.1s
+    attempts = 0
+    
+    while attempts < MAX_DRIVE_ATTEMPTS:
+        current_x, current_y = get_position()
+        dx = target_x - current_x
+        dy = target_y - current_y
+        distance_to_target = math.sqrt(dx**2 + dy**2)
+
+        # print(f"[AGV] To target: X:{current_x:.1f}->{target_x:.1f} (dx:{dx:.1f}), Y:{current_y:.1f}->{target_y:.1f} (dy:{dy:.1f}), Dist:{distance_to_target:.1f}")
+
+        if distance_to_target <= DRIVE_STOP_THRESHOLD_CM:
+            print(f"[AGV] Near target (dist {distance_to_target:.1f} cm). Sending STOP (9).")
+            esp_serial_conn.write(b'9')
+            print(f"[AGV] Target reached.")
+            return
         
-        # UUID för Serial Port Profile (SPP)
-        spp_uuid = "00001101-0000-1000-8000-00805F9B34FB"
-        service_name = "AGVControlServer_mimii13"
+        time.sleep(0.1) # Control loop frequency
+        attempts += 1
 
-        bluetooth.advertise_service(server_sock, service_name,
-                                    service_id=spp_uuid,
-                                    service_classes=[spp_uuid, bluetooth.SERIAL_PORT_CLASS],
-                                    profiles=[bluetooth.SERIAL_PORT_PROFILE],
-                                    # provider='YourCompanyName', # Valfritt
-                                    # description='AGV Control Service' # Valfritt
-                                    )
-        print(f"[AGV] Bluetooth-server '{service_name}' startad på port {port}. Väntar på anslutning...")
+    print(f"[AGV] Timeout or max attempts reached trying to reach target. Sending STOP (9).")
+    esp_serial_conn.write(b'9')
 
-        while True: # Loop för att acceptera nya klienter efter att en har kopplat från
-            client_sock_temp, client_info = server_sock.accept()
-            print(f"[AGV] Bluetooth-klient ansluten: {client_info}")
-            
-            with active_client_sock_lock:
-                if active_client_sock: # Om en gammal klient fortfarande är markerad (bör inte hända ofta)
-                    try: active_client_sock.close()
-                    except: pass
-                active_client_sock = client_sock_temp # Sätt den nya klienten som aktiv
 
-            try:
-                while True: # Loop för att hantera kommandon från den anslutna klienten
-                    data = active_client_sock.recv(1024) # Ta emot data (max 1024 bytes)
-                    if not data:
-                        print("[AGV] Tom data mottagen från klient, antar frånkoppling.")
-                        break # Avsluta kommandoloopen för denna klient
-                    
-                    data_str = data.decode("utf-8", errors='ignore').strip()
-                    print(f"[BT_RECV_FROM_CLIENT] '{data_str}'")
+server_sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+server_sock.bind(("", bluetooth.PORT_ANY))
+server_sock.listen(1)
+port = server_sock.getsockname()[1]
+uuid = "00001101-0000-1000-8000-00805F9B34FB" 
+# Consider advertising the service for easier discovery
+# bluetooth.advertise_service(...) 
+print(f"[AGV] Bluetooth server started on RFCOMM channel {port}. Waiting for connection...")
 
-                    if data_str.startswith("GT,"): # Målkommando: Go To
-                        parts = data_str.replace("GT,", "").split(",")
-                        if len(parts) >= 2:
-                            target_x_str, target_y_str = parts[0], parts[1]
-                            try:
-                                x = float(target_x_str)
-                                y = float(target_y_str)
-                                send_target_to_esp32(x, y)
-                            except ValueError:
-                                print(f"[AGV] Ogiltiga koordinater från Bluetooth: X='{target_x_str}', Y='{target_y_str}'")
-                                if active_client_sock:
-                                     active_client_sock.send("ERROR: Invalid coordinates format. Use GT,float,float\n".encode("utf-8"))
+try:
+    while True:
+        client_sock, client_info = server_sock.accept()
+        print(f"[AGV] Client connected: {client_info}")
+        # Start DWM position task for each client, or manage a single global one
+        # For simplicity, starting one per client here. Ensure old ones are handled if needed.
+        # Make sure DWM task can handle client_sock closure properly
+        dwm_thread = threading.Thread(target=dwm_position_task, args=(client_sock,), daemon=True)
+        dwm_thread.start()
+        
+        data_buffer = ""
+        try:
+            while True: # Loop for this specific client
+                raw_data = client_sock.recv(1024) # Receive raw bytes
+                if not raw_data:
+                    print("[AGV] Client disconnected (no data).")
+                    break 
+                
+                data_buffer += raw_data.decode("utf-8", errors='ignore') # Decode safely
+                
+                # Process complete lines
+                while '\n' in data_buffer:
+                    line, data_buffer = data_buffer.split('\n', 1)
+                    line = line.strip() # Remove \r and leading/trailing whitespace
+                    if not line: # Skip empty lines
+                        continue
+
+                    print(f"[AGV] Received: {line}")
+                    if line.startswith("GT"):
+                        parts = line.replace("GT,", "").split(",")
+                        if len(parts) == 3:
+                            target_x_s, target_y_s, V_s = parts
+                            # Run send_move_commands in a new thread to keep main BT loop responsive
+                            threading.Thread(target=send_move_commands, 
+                                             args=(esp_serial, target_x_s, target_y_s, V_s), 
+                                             daemon=True).start()
                         else:
-                            if active_client_sock:
-                                active_client_sock.send("ERROR: Invalid GT command format. Use GT,x,y\n".encode("utf-8"))
-
-
-                    elif data_str == "STOP":
-                        send_stop_to_esp32()
-                    
-                    elif data_str == "GET_POS": # Kommando för att hämta aktuell position
-                         current_x, current_y = get_agv_position()
-                         pos_msg = f"CURRENT_POS,{current_x:.2f},{current_y:.2f}\n"
-                         if active_client_sock:
-                             active_client_sock.send(pos_msg.encode("utf-8"))
-                             # print(f"[AGV] Skickade position till klient: {pos_msg.strip()}")
-                    
-                    elif data_str == "START_LIDAR":
-                        if not lidar_active:
-                            lidar_active = True
-                            # Starta lidar-task i en tråd om den inte redan körs
-                            # Se till att lidar_task_function hanterar sin egen flagga och anslutning
-                            threading.Thread(target=lidar_task_function, daemon=True).start()
-                            print("[AGV] Lidar start-kommando mottaget. Försöker starta Lidar-task.")
-                            if active_client_sock: active_client_sock.send("LIDAR_STARTING\n".encode("utf-8"))
+                            print(f"[AGV] Invalid GT command: {line}")
+                    elif line == "lidar":
+                        if not lidar_active: # Start only if not already active
+                            threading.Thread(target=lidar_task, args=(client_sock,), daemon=True).start()
                         else:
-                            print("[AGV] Lidar är redan aktiv.")
-                            if active_client_sock: active_client_sock.send("LIDAR_ALREADY_ACTIVE\n".encode("utf-8"))
-                    
-                    elif data_str == "STOP_LIDAR":
-                        if lidar_active:
-                            lidar_active = False # Signalera till Lidar-tasken att avsluta
-                            print("[AGV] Lidar stopp-kommando mottaget. Försöker stoppa Lidar-task.")
-                            if active_client_sock: active_client_sock.send("LIDAR_STOPPING\n".encode("utf-8"))
+                            print("[AGV] LIDAR task already running.")
+                    elif line == "STOP":
+                        print("[AGV] STOP command received. Forwarding to ESP.")
+                        esp_serial.write(b'9')
+                    elif line == "position":
+                        # DWM task is already started on connection. 
+                        # This could be used to re-initialize or confirm it's running.
+                        if dwm_thread and dwm_thread.is_alive():
+                            print("[AGV] DWM position task is active.")
                         else:
-                            print("[AGV] Lidar är inte aktiv.")
-                            if active_client_sock: active_client_sock.send("LIDAR_NOT_ACTIVE\n".encode("utf-8"))
-                    else:
-                        if active_client_sock:
-                            active_client_sock.send(f"UNKNOWN_COMMAND: {data_str}\n".encode("utf-8"))
+                            print("[AGV] DWM position task was not active. Restarting.")
+                            dwm_thread = threading.Thread(target=dwm_position_task, args=(client_sock,), daemon=True)
+                            dwm_thread.start()
+                    # Add other commands here
+                # If data_buffer contains partial line, it will be processed in next recv
+        
+        except bluetooth.btcommon.BluetoothError as e: # More specific BT error
+            print(f"[AGV] Bluetooth connection error: {e}")
+        except OSError as e: # Catches broken pipe, connection reset
+            print(f"[AGV] Client connection OS error: {e}")
+        except Exception as e:
+            print(f"[AGV] Unexpected error in client loop: {e}")
+        finally:
+            print(f"[AGV] Closing connection for {client_info}")
+            client_sock.close()
+            # If DWM/LIDAR tasks are client-specific and need explicit stopping:
+            if lidar_active: # Signal lidar_task to stop if it's client specific
+                lidar_active = False 
+            # dwm_thread is a daemon, will exit when main does or if its loop breaks
 
-
-            except bluetooth.btcommon.BluetoothError as e:
-                # Detta fångar ofta frånkopplingar från klientens sida
-                print(f"[AGV] Bluetooth-fel med klient {client_info}: {e}")
-            except Exception as e:
-                print(f"[AGV] Oväntat fel med klient {client_info}: {e}")
-            finally:
-                print(f"[AGV] Bluetooth-klient {client_info} frånkopplad.")
-                with active_client_sock_lock:
-                    # Nollställ bara om den nuvarande klienten var den som var aktiv globalt
-                    if active_client_sock == client_sock_temp:
-                        active_client_sock = None
-                try:
-                    client_sock_temp.close() # Stäng alltid den temporära socketen för denna klient
-                except: pass # Ignorera fel om den redan är stängd
-
-    except KeyboardInterrupt:
-        print("\n[AGV] Avslutar Bluetooth-server på grund av KeyboardInterrupt...")
-    except Exception as e:
-        print(f"[AGV] Ett kritiskt fel inträffade i main_bluetooth_server: {e}")
-    finally:
-        print("[AGV] Stänger ner resurser...")
-        if lidar_active: # Se till att Lidar-tasken signaleras att stoppa
-            lidar_active = False
-            time.sleep(0.5) # Ge Lidar-tasken lite tid att reagera
-
-        if active_client_sock:
-            try: active_client_sock.close()
-            except: pass
-        if server_sock:
-            try: server_sock.close()
-            except: pass
-        if esp_serial and esp_serial.is_open:
-            try: esp_serial.close()
-            except: pass
-        print("[AGV] Bluetooth-server och seriell anslutning stängda. Programmet avslutas.")
-
-if __name__ == "__main__":
-    main_bluetooth_server()
+except KeyboardInterrupt:
+    print("[AGV] Shutting down Bluetooth server...")
+finally:
+    if 'server_sock' in locals() and server_sock:
+        server_sock.close()
+    if 'esp_serial' in locals() and esp_serial.is_open:
+        esp_serial.close()
+    print("[AGV] Server shut down.")
