@@ -1,0 +1,161 @@
+#include <HardwareSerial.h> // For DWMSerial
+
+// --- PIN-inställningar (matcha din tidigare kod) ---
+#define DWM_RX_PIN 25
+#define DWM_TX_PIN 26
+#define DWM_BAUD 115200
+
+HardwareSerial DWMSerial(1); // UART1 for DWM1001
+
+// --- Globala variabler för DWM1001 TLV-parser ---
+enum {
+  WAIT_HEADER,
+  READ_TYPE,
+  READ_LEN,
+  READ_VALUE,
+  READ_CSUM
+} tlv_state = WAIT_HEADER;
+
+uint8_t tlv_type, tlv_len, tlv_value[32], tlv_valueIdx, tlv_cs;
+float posX_raw_uwb = 0, posY_raw_uwb = 0;
+unsigned long lastDWMDataPrintTime_millis = 0;
+
+// --- Funktion för att skicka kommando till DWM1001 ---
+void sendDWMCommand(uint8_t cmd_type, uint8_t* cmd_value, uint8_t cmd_len) {
+  DWMSerial.write(0x0D); // Start Byte
+  DWMSerial.write(cmd_type);
+  DWMSerial.write(cmd_len);
+  
+  uint8_t checksum = cmd_type ^ cmd_len;
+  for(int i=0; i < cmd_len; ++i) {
+    DWMSerial.write(cmd_value[i]);
+    checksum ^= cmd_value[i];
+  }
+  DWMSerial.write(checksum);
+  delay(10); // Ge DWM tid att bearbeta
+}
+
+
+// --- Setup ---
+void setup() {
+  Serial.begin(115200);
+  while (!Serial); // Vänta på att Serial Monitor öppnas
+  Serial.println("ESP32 DWM1001 Test (10Hz)...");
+
+  DWMSerial.begin(DWM_BAUD, SERIAL_8N1, DWM_RX_PIN, DWM_TX_PIN);
+  Serial.print("DWMSerial (UWB) on UART1: RX="); Serial.print(DWM_RX_PIN);
+  Serial.print(", TX="); Serial.println(DWM_TX_PIN);
+  delay(500); // Ge DWMSerial tid att starta
+
+  // --- Konfigurera DWM1001 för ~10Hz (100ms) uppdateringsfrekvens ---
+
+  // Kommando: dwm_upd_rate_set (0x0A) - intern uppdateringsfrekvens för DWM1001
+  // Värde: 100ms för nominell, 100ms för stillastående (0x0064 -> LSB:0x64, MSB:0x00)
+  uint8_t dwm_set_update_rate_val[] = {0x64, 0x00, 0x64, 0x00}; 
+  sendDWMCommand(0x0A, dwm_set_update_rate_val, sizeof(dwm_set_update_rate_val));
+  Serial.println("Sent DWM1001 command to set internal update rate to 100ms (10Hz).");
+  delay(100);
+
+  // Kommando: dwm_pos_set_update_rate (0x14) - frekvens för positionsrapportering till värden
+  // Värde: 100ms (0x0064 -> LSB:0x64, MSB:0x00)
+  uint8_t dwm_set_report_rate_val[] = {0x64, 0x00};
+  sendDWMCommand(0x14, dwm_set_report_rate_val, sizeof(dwm_set_report_rate_val));
+  Serial.println("Sent DWM1001 command to set position report rate to 100ms (10Hz).");
+  delay(100);
+
+  // Kommando: dwm_loc_filter_cfg_set (0x43) - stäng av DWMs interna positionsfilter
+  // Värde: 0x00 (filter av)
+  uint8_t dwm_filter_off_val[] = {0x00};
+  sendDWMCommand(0x43, dwm_filter_off_val, sizeof(dwm_filter_off_val));
+  Serial.println("Sent DWM1001 command to turn off internal position filter.");
+  delay(100);
+
+  Serial.println("DWM1001 configuration sent. Listening for position data...");
+}
+
+// --- Loop ---
+void loop() {
+  bool newDataReceived = false;
+
+  while (DWMSerial.available()) {
+    uint8_t b = DWMSerial.read();
+    // Serial.print(b, HEX); Serial.print(" "); // Rådata-debug om nödvändigt
+
+    switch (tlv_state) {
+      case WAIT_HEADER:
+        if (b == 0x0D) { // Start byte för TLV
+          tlv_state = READ_TYPE;
+        }
+        break;
+      case READ_TYPE:
+        tlv_type = b;
+        tlv_state = READ_LEN;
+        break;
+      case READ_LEN:
+        tlv_len = b;
+        tlv_valueIdx = 0;
+        if (tlv_len == 0) { // Inget värde, gå direkt till checksumma
+          tlv_state = READ_CSUM;
+        } else if (tlv_len > sizeof(tlv_value)) { // För långt värde, ogiltigt
+           Serial.println("TLV Error: Value too long!");
+           tlv_state = WAIT_HEADER;
+        }
+        else {
+          tlv_state = READ_VALUE;
+        }
+        break;
+      case READ_VALUE:
+        tlv_value[tlv_valueIdx++] = b;
+        if (tlv_valueIdx == tlv_len) {
+          tlv_state = READ_CSUM;
+        }
+        break;
+      case READ_CSUM:
+        tlv_cs = b;
+        // Verifiera checksumma
+        uint8_t calculated_cs = tlv_type ^ tlv_len;
+        for (int i = 0; i < tlv_len; ++i) {
+          calculated_cs ^= tlv_value[i];
+        }
+
+        if (tlv_cs == calculated_cs) {
+          // Checksumma OK, bearbeta paketet
+          if (tlv_type == 0x41 && tlv_len >= 13) { // Position Data (dwm_loc_data_type)
+            // PANS API: X, Y, Z (int32_t, mm), Quality (uint8_t)
+            // Vi är intresserade av X och Y
+            // Värdena är i little-endian format
+            int32_t x_mm = (int32_t)(tlv_value[0] | (tlv_value[1] << 8) | (tlv_value[2] << 16) | (tlv_value[3] << 24));
+            int32_t y_mm = (int32_t)(tlv_value[4] | (tlv_value[5] << 8) | (tlv_value[6] << 16) | (tlv_value[7] << 24));
+            // int32_t z_mm = (int32_t)(tlv_value[8] | (tlv_value[9] << 8) | (tlv_value[10] << 16) | (tlv_value[11] << 24));
+            // uint8_t quality = tlv_value[12];
+
+            posX_raw_uwb = x_mm / 1000.0f; // Konvertera från mm till meter
+            posY_raw_uwb = y_mm / 1000.0f; // Konvertera från mm till meter
+            newDataReceived = true;
+          } else {
+            // Annan typ av TLV-paket, kan skrivas ut för debug om man vill
+            // Serial.print("Received TLV Type: 0x"); Serial.print(tlv_type, HEX);
+            // Serial.print(", Len: "); Serial.println(tlv_len);
+          }
+        } else {
+          Serial.print("Checksum error! Expected: "); Serial.print(calculated_cs, HEX);
+          Serial.print(", Got: "); Serial.println(tlv_cs, HEX);
+        }
+        tlv_state = WAIT_HEADER; // Återställ för nästa paket
+        break;
+    }
+  } // end while DWMSerial.available()
+
+  if (newDataReceived) {
+    unsigned long currentTime = millis();
+    // Skriv ut positionen, men inte för ofta för att undvika att spamma Serial Monitor
+    if (currentTime - lastDWMDataPrintTime_millis >= 100) { // Ca 10Hz utskrift
+        lastDWMDataPrintTime_millis = currentTime;
+        Serial.print("DWM1001 Position: X=");
+        Serial.print(posX_raw_uwb, 3); // 3 decimaler
+        Serial.print(" m, Y=");
+        Serial.print(posY_raw_uwb, 3); // 3 decimaler
+        Serial.println(" m");
+    }
+  }
+}
