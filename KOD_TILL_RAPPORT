@@ -1,0 +1,576 @@
+import bluetooth
+import time
+import os
+import serial
+import struct
+import threading
+import math
+import numpy as np
+import threading
+from collections import deque
+
+stop_flag = threading.Event()
+
+lidar_busy = threading.Lock()
+
+lidar_thread = None  # Reference to current lidar_task thread
+client_sock_ref = None  # Bluetooth socket saved for reuse
+
+
+JUMP_THRESHOLD = 15
+SMOOTHING_FACTOR = 0.4
+
+# === KONFIGURATION ===
+position_lock = threading.Lock()
+position_buffer_x = deque(maxlen=3)
+position_buffer_y = deque(maxlen=3)
+
+x, y = 44.0, 133.0
+lidar_active = True
+LIDAR_PORT 	= "/dev/ttyUSB0"
+LIDAR_BAUDRATE = 460800
+CMD_STOP = b'\xA5\x25'
+CMD_SCAN = b'\xA5\x20'
+check_angles = [i for i in range(0, 360, 1)]
+esp_serial = serial.Serial('/dev/ttyS0', 115200, timeout=1)
+
+# === Kalmanfilterkonfiguration ===
+kalman_x = {
+    'x': 44.0,
+    'v': 0.0,
+    'P': np.array([[5, 1], [1, 5]], dtype=np.float32)
+}
+kalman_y = {
+    'x': 133.0,
+    'v': 0.0,
+    'P': np.array([[5, 1], [1, 5]], dtype=np.float32)
+}
+Q = np.array([[0.3, 0], [0, 0.3]])
+R_base = 15
+speed_factor = 1.5
+dt = 0.1
+
+#def calculate_dynamic_R(speed):
+  #  return R_base + speed_factor * (speed)
+
+def kalman_update(kalman_state, acc, measurement=None):
+    dt = 0.1  # Tidssteg
+
+    # Dynamiskt Q baserat p hastighet
+    def calculate_dynamic_Q(speed):
+        factor = max(1, speed / 10)
+        return np.array([[0.5 * factor, 0], [0, 0.5 * factor]])
+
+    # Dynamiskt R baserat p hastighet
+    def calculate_dynamic_R(speed):
+        R_base = 5.0
+        speed_factor = 1.0
+        return max(R_base / max(speed, 1), 5.0)
+
+    A = np.array([[1, dt], [0, 1]])
+    B = np.array([[0.5 * dt**2], [dt]])
+    x = np.array([[kalman_state['x']], [kalman_state['v']]])
+    u = np.array([[acc]])
+
+    # Berkna dynamiskt Q
+    speed = np.abs(kalman_state['v'])
+    dynamic_Q = calculate_dynamic_Q(speed)
+
+
+
+    x_pred = A @ x + B @ u
+    P_pred = A @ kalman_state['P'] @ A.T + dynamic_Q
+
+    # Dynamiskt R
+    dynamic_R = calculate_dynamic_R(speed)
+
+    # Uppdatering
+    if measurement is not None:
+        H = np.array([[1, 0]])
+        z = np.array([[measurement]])
+        y = z - H @ x_pred
+        S = H @ P_pred @ H.T + dynamic_R
+        K = P_pred @ H.T @ np.linalg.inv(S)
+
+        # Justera Kalman Gain vid hg hastighet
+        if speed > 5:
+            K = K * 1.5
+
+        x_new = x_pred + K @ y
+        P_new = (np.eye(2) - K @ H) @ P_pred
+    else:
+        x_new = x_pred
+        P_new = P_pred
+
+    kalman_state['x'] = x_new[0, 0]
+    kalman_state['v'] = x_new[1, 0]
+    kalman_state['P'] = P_new
+
+    return kalman_state['x']
+
+
+    
+def get_descriptor(ser):
+    descriptor = ser.read(7)
+    if descriptor[:2] != b'\xA5\x5A':
+        raise Exception("Misslyckades med att ta emot scan descriptor")
+def update_position(new_x, new_y):
+    global x, y
+    with position_lock:
+        x, y = new_x, new_y
+        #print(f"[Position] Uppdaterad: x={x}, y={y}")
+def get_position():
+    global x, y
+    with position_lock:
+        return x, y
+def parse_packet(packet):
+    if len(packet) != 5:
+        return None
+    b0, b1, b2, b3, b4 = struct.unpack('<BBBBB', packet)
+    start_flag = b0 & 0x01
+    inverted_start_flag = (b0 >> 1) & 0x01
+    if start_flag != (~inverted_start_flag & 0x01):
+        return None
+    quality = b0 >> 2
+    angle_q6 = ((b2 << 7) | (b1 >> 1))
+    angle = (angle_q6 / 64.0) % 360
+    dist_q2 = (b4 << 8) | b3
+    distance_cm = round((dist_q2 / 4.0) / 10.0)
+    return angle, max(0, distance_cm), quality
+
+
+def lidar_task(client_sock):
+    global lidar_active
+    if not lidar_busy.acquire(timeout=1):
+        print("[AGV] LIDAR task blocked: device busy")
+        return
+
+    lidar_active = True
+    try:
+        with serial.Serial(LIDAR_PORT, LIDAR_BAUDRATE, timeout=1) as ser:
+            ser.write(CMD_STOP)
+            time.sleep(0.1)
+            ser.reset_input_buffer()
+            ser.write(CMD_SCAN)
+            get_descriptor(ser)
+
+            temp_array = [0] * len(check_angles)
+            current_index = 0
+
+            while lidar_active:
+                packet = ser.read(5)
+                if len(packet) != 5:
+                    continue
+
+                result = parse_packet(packet)
+                if result is None:
+                    continue
+
+                angle, distance_cm, _ = result
+                angle_rounded = round(angle)
+                target_angle = check_angles[current_index]
+
+                if abs(angle_rounded - target_angle) <= 1:
+                    temp_array[current_index] = round(distance_cm, 1)
+                    current_index += 1
+
+                    if current_index >= len(check_angles):
+                        current_index = 0
+                        lidar_string = "LIDAR:" + ",".join(map(str, temp_array))
+                        client_sock.send((lidar_string + "\n").encode("utf-8"))
+                        #print(lidar_string)
+                        #print("[AGV] Skicka:", lidar_string)
+    except Exception as e:
+        print("[AGV] LIDAR error:", e)
+    finally:
+        try:
+            ser.write(CMD_STOP)
+            time.sleep(0.1)
+        except:
+            pass
+        lidar_active = False
+        lidar_busy.release()
+
+
+
+# ======= Lidar svep capture ======= #
+def wait_for_lidar_idle(timeout=5.0):
+    """Wait until lidar_active is False and lidar_busy is released (not locked).
+    Returns True if LIDAR is idle within the timeout, False otherwise.
+    """
+    global lidar_active, lidar_busy
+    start = time.time()
+    while time.time() - start < timeout:
+        if not lidar_active and not lidar_busy.locked():
+            return True
+        time.sleep(0.05)
+    print("[AGV] Warning: Timeout waiting for LIDAR to become idle.")
+    return False
+    
+def capture_lidar_sweep():
+    """Capture a full LIDAR sweep (360 degrees), ensuring exclusive access.
+    Returns the sweep array or None on failure.
+    """
+    if not lidar_busy.acquire(timeout=2):
+        print("[AGV] LIDAR sweep skipped: device busy (exclusive lock not acquired)")
+        return None
+
+    try:
+        import serial
+        with serial.Serial(LIDAR_PORT, LIDAR_BAUDRATE, timeout=1) as ser:
+            ser.write(CMD_STOP)
+            time.sleep(0.2)            # Give LIDAR time to stop
+            ser.reset_input_buffer()
+            ser.write(CMD_SCAN)
+            get_descriptor(ser)
+
+            scan = [0] * 360
+            received = 0
+            start_time = time.time()
+            MIN_REQUIRED = 320
+
+            while received < 360 and time.time() - start_time < 5.5:
+                packet = ser.read(5)
+                result = parse_packet(packet)
+                if result:
+                    angle, distance_cm, _ = result
+                    angle_index = int(round(angle)) % 360
+                    if scan[angle_index] == 0 and distance_cm > 0:
+                        scan[angle_index] = distance_cm
+                        received += 1
+                        
+            if received >= MIN_REQUIRED:
+                print(f"[AGV] Sweep collected {received}/360 points")
+                return scan
+            else:
+                print(f"[AGV] Incomplete LIDAR sweep: {received}/360")
+                return None
+    except Exception as e:
+        print("[AGV] LIDAR sweep error:", e)
+        return None
+    finally:
+        lidar_busy.release()
+
+
+
+
+
+# ======= JÃ¤mfÃ¶r Lidar fÃ¶re och efter rotation och matcha med bÃ¤sta shift ======= #
+def estimate_rotation_error(before, after, angle=0, window=30):
+    """
+    Compares two lidar sweeps and estimates the actual rotation.
+    Searches for the best shift in the range [angle-window, angle+window].
+    Returns the shift (degrees) that gives the best match.
+    """
+    best_shift = angle
+    best_score = float('-inf')
+
+    for shift in range(int(angle - window), int(angle + window + 1)):
+        score = 0
+        for i in range(360):
+            j = (i + shift) % 360
+            d1 = before[i]
+            d2 = after[j]
+            if 100 < d1 < 3000 and 100 < d2 < 3000:
+                diff = abs(d1 - d2)
+                score -= diff
+        if score > best_score:
+            best_score = score
+            best_shift = shift
+
+    return best_shift - angle
+
+
+
+def stabilize_position(new_x, new_y):
+    global x, y
+    
+    if x == 0.0 and y == 0.0:
+        x, y = new_x, new_y
+        return round(x), round(y)
+    
+    dx = new_x - x
+    dy = new_y - y
+    distance = (dx**2 + dy**2)**0.5
+
+    if distance > JUMP_THRESHOLD:
+        print(f"? Ignorerar hopp: {distance:.2f} cm")
+        return x, y
+
+    # Glidande justering mot den nya positionen
+    x = x + SMOOTHING_FACTOR * dx
+    y = y + SMOOTHING_FACTOR * dy
+
+    return round(x), round(y)
+
+def mean_position():
+    if len(position_buffer_x) == 0 or len(position_buffer_y) == 0:
+        return 0, 0
+    mean_x = sum(position_buffer_x) / len(position_buffer_x)
+    mean_y = sum(position_buffer_y) / len(position_buffer_y)
+    return round(mean_x), round(mean_y)
+
+def dwm_position_task(client_sock):
+    global x, y
+    ax, ay = 0.0, 0.0
+
+    try:
+        with serial.Serial("/dev/ttyACM0", 115200, timeout=1) as ser:
+            ser.write(b"\r")
+            time.sleep(0.1)
+            ser.write(b"\r")
+            time.sleep(0.1)
+
+            start = time.time()
+            while time.time() - start < 2:
+                if ser.in_waiting:
+                    line = ser.readline().decode("utf-8").strip()
+                    if "dwm>" in line:
+                        break
+            ser.write(b'lep')
+            time.sleep(0.1)
+            ser.write(b"quit\r")
+            time.sleep(0.2)
+            ser.write(b"\r")
+            time.sleep(0.05)
+            ser.write(b"\r")
+            time.sleep(0.2)
+
+            time.sleep(0.1)
+            ser.write(b"lep\r")
+            time.sleep(0.2) 
+
+            print("[AGV] DWM-positionering startad.")
+
+            while True:
+                if esp_serial.in_waiting:
+                    esp_line = esp_serial.readline().decode().strip()
+                    if esp_line.startswith("mpu:"):
+                        try:
+                            parts = esp_line.replace("mpu:", "").split(",")
+                            ax = float(parts[0].split(",")[1])
+                            ay = float(parts[1].split(",")[1])
+                        except Exception as e:
+                            print("[Kalman] Fel vid parsing av MPU:", e)
+
+                if ser.in_waiting:
+                    line = ser.readline().decode("utf-8").strip()
+                    if line.startswith("POS,"):
+                        parts = line.split(",")
+                        if len(parts) >= 5:
+                            try:
+                                raw_x = float(parts[1]) * 100.0
+                                raw_y = float(parts[2]) * 100.0
+
+                                x_filtered = kalman_update(kalman_x, ax, raw_x)
+                                y_filtered = kalman_update(kalman_y, ay, raw_y)
+                                x = x_filtered
+                                y = y_filtered
+                                x, y = stabilize_position(x, y)
+
+                                position_buffer_x.append(x)
+                                position_buffer_y.append(y)
+                                x, y = mean_position()
+
+                                # Uppdatera position med mutex
+                                update_position(round(x+16.0, 1), round(y+13.0, 1))
+                                client_sock.send(f"POS:{x-16.0},{y-13.0}\r\n".encode("utf-8"))
+                                #print(f"[AGV] Kalman POS: {mx},{my}")
+                            except Exception as e:
+                                print("[Kalman] Fel vid positionsberkning:", e)
+    except Exception as e:
+        print("[AGV] DWM-fel:", e)
+
+def send_move_commands(esp_serial, target_x, target_y, angle):
+    global lidar_active, lidar_thread, client_sock_ref
+
+    try:
+        target_x = float(target_x)
+        target_y = float(target_y)
+        angle = float(angle)
+    except ValueError as e:
+        print(f"[AGV] Error parsing coordinates: {e}")
+        return
+
+    current_x, current_y = get_position()
+    dx = target_x - x
+    dy = target_y - y
+
+    if angle != 0:
+        lidar_active = False
+        
+        if lidar_thread is not None and lidar_thread.is_alive():
+            print("[AGV] Waiting for lidar_task thread to stop...")
+            lidar_thread.join(timeout=3)
+            print("[AGV] lidar_task stopped.")
+            lidar_thread = None
+
+        if not wait_for_lidar_idle(timeout=5):
+            print("[AGV] Could not guarantee exclusive LIDAR access before sweep.")
+            return
+
+        print("[AGV] Waiting for robot to settle before reference sweep...")
+        time.sleep(0.7)
+        sweep_before = capture_lidar_sweep()
+    else:
+        sweep_before = None
+
+    # Rotation command
+    if angle == 0:
+        esp_serial.write(b'0')
+        time.sleep(1)
+    elif angle == 45:
+        esp_serial.write(b'2')
+        time.sleep(1)
+    elif angle == 90:
+        esp_serial.write(b'3')
+        time.sleep(1)
+    elif angle == 135:
+        esp_serial.write(b'4')
+        time.sleep(1)
+    elif angle == 180 or angle == -180:
+        esp_serial.write(b'5')
+        time.sleep(1)
+    elif angle == -45:
+        esp_serial.write(b'6')
+        time.sleep(1)
+    elif angle == -90:
+        esp_serial.write(b'7')
+        time.sleep(1)
+    elif angle == -135:
+        esp_serial.write(b'8')
+        time.sleep(1)
+    else:
+        esp_serial.write(b'9')
+        
+    print("[AGV] Waiting for robot to settle after rotation...")
+    time.sleep(0.7)
+
+    if angle != 0 and sweep_before:
+        if not wait_for_lidar_idle(timeout=0.5):
+            print("[AGV] Could not guarantee exclusive LIDAR access before after-scan.")
+            return
+
+        sweep_after = capture_lidar_sweep()
+        if sweep_after:
+            shift = estimate_rotation_error(sweep_before, sweep_after, angle=angle, window=20)
+            print(f"[AGV] Rotation mismatch: {shift} degrees")
+
+            while abs(shift) > 3:
+                if shift > 0:
+                    esp_serial.write(b'b')  # rotate backward
+                else:
+                    esp_serial.write(b'a')  # rotate forward
+                time.sleep(0.4)
+
+                print("[AGV] Waiting before correction sweep...")
+                time.sleep(0.7)
+
+                if not wait_for_lidar_idle(timeout=0.5):
+                    print("[AGV] Could not guarantee exclusive LIDAR access before correction sweep.")
+                    return
+
+                sweep_after = capture_lidar_sweep()
+                shift = estimate_rotation_error(sweep_before, sweep_after, angle=angle, window=20)
+                print(f"[AGV] Adjusted rotation, new diff: {shift}")
+                
+    # Restart lidar_task
+    if client_sock_ref:
+        print("[AGV] Restarting lidar_task after rotation...")
+        lidar_active = False
+        lidar_thread = threading.Thread(
+            target=lidar_task,
+            args=(client_sock_ref,),
+            daemon=True,
+            name="lidar_thread"
+        )
+        lidar_thread.start()
+    
+
+    lidar_active = True
+    time.sleep(3)
+    esp_serial.write(b'0')  
+    while abs(dx) > 20 and abs(dy) > 20:
+        current_x, current_y = get_position()
+        print(f"[DEBUG] dx={dx}, dy={dy}, entering while?")
+        print("HÃR")
+        dx = target_x - x
+        dy = target_y - y
+        time.sleep(1)
+        esp_serial.write(b'9')
+        time.sleep(1)
+        esp_serial.write(b'0')
+
+        
+
+    if abs(dx) <= 20 and abs(dy) <= 20:
+        print(f"[AGV] Nra mlet: dx={dx}, dy={dy}, skickar kommando 9 (stopp)")
+        esp_serial.write(b'9')
+        time.sleep(2)
+        print(f"[AGV] Mlet ntt: dx={dx}, dy={dy}, skickar kommando 9")
+        return
+
+server_sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+server_sock.bind(("", bluetooth.PORT_ANY))
+server_sock.listen(1)
+port = server_sock.getsockname()[1]
+print(f"[AGV] Bluetooth-server startad pÃ¥ port {port}. VÃ¤ntar pÃ¥ anslutning...")
+
+try:
+    while True:
+        client_sock, client_info = server_sock.accept()
+        print(f"[AGV] Klient ansluten: {client_info}")
+        data_buffer = ""
+        try:
+            while True:
+                data = client_sock.recv(1024).decode("utf-8")
+                if not data:
+                    break
+                data_buffer += data
+                lines = data_buffer.strip().splitlines()
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    print(f"[AGV] Mottaget: {line}")
+                    if line.startswith("GT"):
+                        coords = line.replace("GT,", "").split(",")
+                        target_x, target_y, V = coords if len(coords) == 3 else ("0", "0", "0")
+                        threading.Thread(target=send_move_commands, args=(esp_serial, target_x, target_y, V), daemon=True).start()
+                    elif line == "lidar":
+                        client_sock_ref = client_sock
+                        if lidar_thread is None or not lidar_thread.is_alive():
+                            lidar_thread = threading.Thread(target=lidar_task, args=(client_sock,), daemon=True, name="lidar_thread")
+                            lidar_thread.start()
+                        #threading.Thread(target=lidar_task, args=(client_sock,), daemon=True).start()
+                    elif line == "STOP":
+                        esp_serial.write(b'9')
+                    elif line == "R":
+                        print("[AGV] Startar lyssning efter 'ACK: UPG_klar'...")
+
+						# Read serial until expected ACK is received
+                        start_time = time.time()
+                        timeout = 15.0  # optional: timeout after 5 seconds
+                        while time.time() - start_time < timeout:
+                            if esp_serial.in_waiting:
+                                response = esp_serial.readline().decode("utf-8").strip()
+                                print(f"[ESP] ? {response}")
+
+                            if response == "ACK: UPG_klar":
+                                    print("[AGV] Mottog korrekt ACK, skickar 'c'")
+                                    esp_serial.write(b'c')
+                                    break
+                    elif line == "position":
+                        threading.Thread(target=dwm_position_task, args=(client_sock,), daemon=True).start()
+                data_buffer = ""
+        except OSError as e:
+            print(f"[AGV] Anslutning avslutad ({e})")
+        finally:
+            client_sock.close()
+            print("[AGV] VÃ¤ntar pÃ¥ ny anslutning...")
+except KeyboardInterrupt:
+    print("[AGV] Avslutar Bluetooth-server...")
+    server_sock.close()
+    esp_serial.close()
+
+        
