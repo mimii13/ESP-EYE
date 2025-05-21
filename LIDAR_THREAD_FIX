@@ -105,6 +105,7 @@ class LidarManager:
 
     def exclusive_sweep(self):
         self.pause()
+        result = None
         with self.lock:
             try:
                 with serial.Serial(LIDAR_PORT, LIDAR_BAUDRATE, timeout=1) as ser:
@@ -119,28 +120,66 @@ class LidarManager:
                     MIN_REQUIRED = 320
                     while received < 360 and time.time() - start_time < 5.5:
                         packet = ser.read(5)
-                        result = parse_packet(packet)
-                        if result:
-                            angle, distance_cm, _ = result
+                        result_packet = parse_packet(packet)
+                        if result_packet:
+                            angle, distance_cm, _ = result_packet
                             angle_index = int(round(angle)) % 360
                             if scan[angle_index] == 0 and distance_cm > 0:
                                 scan[angle_index] = distance_cm
                                 received += 1
                     if received >= MIN_REQUIRED:
                         print(f"[AGV] Sweep collected {received}/360 points")
-                        return scan
+                        result = scan
                     else:
                         print(f"[AGV] Incomplete LIDAR sweep: {received}/360")
-                        return None
+                        result = None
             except Exception as e:
                 print("[AGV] LIDAR sweep error:", e)
-                return None
+                result = None
         self.resume()
+        return result
 
 lidar_mgr = LidarManager()
 client_sock_ref = None  # Set on connection
 
-# --- THE REST OF YOUR CODE (unchanged, except for LIDAR USAGE) ---
+# --- KALMAN FILTER ---
+def kalman_update(kalman_state, acc, measurement=None):
+    dt = 0.1  # Tidssteg
+    def calculate_dynamic_Q(speed):
+        factor = max(1, speed / 10)
+        return np.array([[0.5 * factor, 0], [0, 0.5 * factor]])
+
+    def calculate_dynamic_R(speed):
+        R_base = 5.0
+        speed_factor = 1.0
+        return max(R_base / max(speed, 1), 5.0)
+
+    A = np.array([[1, dt], [0, 1]])
+    B = np.array([[0.5 * dt**2], [dt]])
+    x = np.array([[kalman_state['x']], [kalman_state['v']]])
+    u = np.array([[acc]])
+    speed = np.abs(kalman_state['v'])
+    dynamic_Q = calculate_dynamic_Q(speed)
+    x_pred = A @ x + B @ u
+    P_pred = A @ kalman_state['P'] @ A.T + dynamic_Q
+    dynamic_R = calculate_dynamic_R(speed)
+    if measurement is not None:
+        H = np.array([[1, 0]])
+        z = np.array([[measurement]])
+        y = z - H @ x_pred
+        S = H @ P_pred @ H.T + dynamic_R
+        K = P_pred @ H.T @ np.linalg.inv(S)
+        if speed > 5:
+            K = K * 1.5
+        x_new = x_pred + K @ y
+        P_new = (np.eye(2) - K @ H) @ P_pred
+    else:
+        x_new = x_pred
+        P_new = P_pred
+    kalman_state['x'] = x_new[0, 0]
+    kalman_state['v'] = x_new[1, 0]
+    kalman_state['P'] = P_new
+    return kalman_state['x']
 
 def get_descriptor(ser):
     descriptor = ser.read(7)
@@ -172,19 +211,110 @@ def parse_packet(packet):
     distance_cm = round((dist_q2 / 4.0) / 10.0)
     return angle, max(0, distance_cm), quality
 
-# Remove lidar_busy, lidar_active, and lidar_thread global vars!
-
 def wait_for_lidar_idle(timeout=5.0):
-    # Not needed in the new version, but kept for compatibility
-    return True
+    return True  # No longer needed, but kept for compatibility
 
 def capture_lidar_sweep():
     return lidar_mgr.exclusive_sweep()
 
-# The rest of your code - update all places that start/stop lidar threads or access lidar_active/lidar_busy
-# Example: replace lidar_thread = threading.Thread(target=lidar_task, ...) with lidar_mgr.start(...)
-# Replace lidar_active = False/True with lidar_mgr.pause()/lidar_mgr.resume()
-# For exclusive sweep: use capture_lidar_sweep()
+def estimate_rotation_error(before, after, angle=0, window=30):
+    best_shift = angle
+    best_score = float('-inf')
+    for shift in range(int(angle - window), int(angle + window + 1)):
+        score = 0
+        for i in range(360):
+            j = (i + shift) % 360
+            d1 = before[i]
+            d2 = after[j]
+            if 100 < d1 < 3000 and 100 < d2 < 3000:
+                diff = abs(d1 - d2)
+                score -= diff
+        if score > best_score:
+            best_score = score
+            best_shift = shift
+    return best_shift - angle
+
+def stabilize_position(new_x, new_y):
+    global x, y
+    if x == 0.0 and y == 0.0:
+        x, y = new_x, new_y
+        return round(x), round(y)
+    dx = new_x - x
+    dy = new_y - y
+    distance = (dx**2 + dy**2)**0.5
+    if distance > JUMP_THRESHOLD:
+        print(f"? Ignorerar hopp: {distance:.2f} cm")
+        return x, y
+    x = x + SMOOTHING_FACTOR * dx
+    y = y + SMOOTHING_FACTOR * dy
+    return round(x), round(y)
+
+def mean_position():
+    if len(position_buffer_x) == 0 or len(position_buffer_y) == 0:
+        return 0, 0
+    mean_x = sum(position_buffer_x) / len(position_buffer_x)
+    mean_y = sum(position_buffer_y) / len(position_buffer_y)
+    return round(mean_x), round(mean_y)
+
+def dwm_position_task(client_sock):
+    global x, y
+    ax, ay = 0.0, 0.0
+    try:
+        with serial.Serial("/dev/ttyACM0", 115200, timeout=1) as ser:
+            ser.write(b"\r")
+            time.sleep(0.1)
+            ser.write(b"\r")
+            time.sleep(0.1)
+            start = time.time()
+            while time.time() - start < 2:
+                if ser.in_waiting:
+                    line = ser.readline().decode("utf-8").strip()
+                    if "dwm>" in line:
+                        break
+            ser.write(b'lep')
+            time.sleep(0.1)
+            ser.write(b"quit\r")
+            time.sleep(0.2)
+            ser.write(b"\r")
+            time.sleep(0.05)
+            ser.write(b"\r")
+            time.sleep(0.2)
+            time.sleep(0.1)
+            ser.write(b"lep\r")
+            time.sleep(0.2)
+            print("[AGV] DWM-positionering startad.")
+            while True:
+                if esp_serial.in_waiting:
+                    esp_line = esp_serial.readline().decode().strip()
+                    if esp_line.startswith("mpu:"):
+                        try:
+                            parts = esp_line.replace("mpu:", "").split(",")
+                            ax = float(parts[0].split(",")[1])
+                            ay = float(parts[1].split(",")[1])
+                        except Exception as e:
+                            print("[Kalman] Fel vid parsing av MPU:", e)
+                if ser.in_waiting:
+                    line = ser.readline().decode("utf-8").strip()
+                    if line.startswith("POS,"):
+                        parts = line.split(",")
+                        if len(parts) >= 5:
+                            try:
+                                raw_x = float(parts[1]) * 100.0
+                                raw_y = float(parts[2]) * 100.0
+                                x_filtered = kalman_update(kalman_x, ax, raw_x)
+                                y_filtered = kalman_update(kalman_y, ay, raw_y)
+                                x = x_filtered
+                                y = y_filtered
+                                x, y = stabilize_position(x, y)
+                                position_buffer_x.append(x)
+                                position_buffer_y.append(y)
+                                x, y = mean_position()
+                                update_position(round(x+16.0, 1), round(y+13.0, 1))
+                                client_sock.send(f"POS:{x-16.0},{y-13.0}\r\n".encode("utf-8"))
+                            except Exception as e:
+                                print("[Kalman] Fel vid positionsberkning:", e)
+    except Exception as e:
+        print("[AGV] DWM-fel:", e)
 
 def send_move_commands(esp_serial, target_x, target_y, angle):
     global client_sock_ref
@@ -195,21 +325,16 @@ def send_move_commands(esp_serial, target_x, target_y, angle):
     except ValueError as e:
         print(f"[AGV] Error parsing coordinates: {e}")
         return
-
     current_x, current_y = get_position()
     dx = target_x - x
     dy = target_y - y
-
     if angle != 0:
         lidar_mgr.pause()
-
         print("[AGV] Waiting for robot to settle before reference sweep...")
         time.sleep(0.7)
         sweep_before = capture_lidar_sweep()
     else:
         sweep_before = None
-
-    # Rotation command
     if angle == 0:
         esp_serial.write(b'0')
         time.sleep(1)
@@ -236,10 +361,8 @@ def send_move_commands(esp_serial, target_x, target_y, angle):
         time.sleep(1)
     else:
         esp_serial.write(b'9')
-        
     print("[AGV] Waiting for robot to settle after rotation...")
     time.sleep(0.7)
-
     if angle != 0 and sweep_before:
         sweep_after = capture_lidar_sweep()
         if sweep_after:
@@ -256,14 +379,11 @@ def send_move_commands(esp_serial, target_x, target_y, angle):
                 sweep_after = capture_lidar_sweep()
                 shift = estimate_rotation_error(sweep_before, sweep_after, angle=angle, window=20)
                 print(f"[AGV] Adjusted rotation, new diff: {shift}")
-
-    # Resume lidar after exclusive sweep
     if client_sock_ref:
         print("[AGV] Restarting lidar_task after rotation...")
         lidar_mgr.resume()
-
     time.sleep(3)
-    esp_serial.write(b'0')  
+    esp_serial.write(b'0')
     while abs(dx) > 20 or abs(dy) > 20:
         current_x, current_y = get_position()
         print(f"[DEBUG] dx={dx}, dy={dy}, entering while?")
@@ -274,7 +394,6 @@ def send_move_commands(esp_serial, target_x, target_y, angle):
         esp_serial.write(b'9')
         time.sleep(1)
         esp_serial.write(b'0')
-
     if abs(dx) <= 20 and abs(dy) <= 20:
         print(f"[AGV] Nra mlet: dx={dx}, dy={dy}, skickar kommando 9 (stopp)")
         esp_serial.write(b'9')
@@ -282,7 +401,6 @@ def send_move_commands(esp_serial, target_x, target_y, angle):
         print(f"[AGV] Mlet ntt: dx={dx}, dy={dy}, skickar kommando 9")
         return
 
-# --- Bluetooth server loop: update lidar thread usage ---
 server_sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
 server_sock.bind(("", bluetooth.PORT_ANY))
 server_sock.listen(1)
