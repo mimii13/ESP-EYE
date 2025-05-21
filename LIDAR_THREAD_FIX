@@ -1,0 +1,341 @@
+import bluetooth
+import time
+import os
+import serial
+import struct
+import threading
+import math
+import numpy as np
+from collections import deque
+
+# === KONFIGURATION ===
+JUMP_THRESHOLD = 15
+SMOOTHING_FACTOR = 0.4
+position_lock = threading.Lock()
+position_buffer_x = deque(maxlen=3)
+position_buffer_y = deque(maxlen=3)
+
+x, y = 44.0, 133.0
+LIDAR_PORT = "/dev/ttyUSB0"
+LIDAR_BAUDRATE = 460800
+CMD_STOP = b'\xA5\x25'
+CMD_SCAN = b'\xA5\x20'
+check_angles = [i for i in range(0, 360, 1)]
+esp_serial = serial.Serial('/dev/ttyS0', 115200, timeout=1)
+
+kalman_x = {
+    'x': 44.0,
+    'v': 0.0,
+    'P': np.array([[5, 1], [1, 5]], dtype=np.float32)
+}
+kalman_y = {
+    'x': 133.0,
+    'v': 0.0,
+    'P': np.array([[5, 1], [1, 5]], dtype=np.float32)
+}
+Q = np.array([[0.3, 0], [0, 0.3]])
+R_base = 15
+speed_factor = 1.5
+dt = 0.1
+
+# --- LIDAR THREADING MANAGEMENT ---
+class LidarManager:
+    def __init__(self):
+        self._pause = threading.Event()  # When set, scanning is enabled
+        self._pause.set()
+        self._stop = threading.Event()
+        self.lock = threading.Lock()
+        self.thread = None
+        self.client_sock = None
+
+    def start(self, client_sock):
+        if self.thread is not None and self.thread.is_alive():
+            return
+        self.client_sock = client_sock
+        self.thread = threading.Thread(target=self._run, args=(client_sock,), daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._pause.set()
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+        self.thread = None
+
+    def pause(self):
+        self._pause.clear()
+
+    def resume(self):
+        self._pause.set()
+
+    def _run(self, client_sock):
+        try:
+            with serial.Serial(LIDAR_PORT, LIDAR_BAUDRATE, timeout=1) as ser:
+                ser.write(CMD_STOP)
+                time.sleep(0.1)
+                ser.reset_input_buffer()
+                ser.write(CMD_SCAN)
+                get_descriptor(ser)
+                temp_array = [0] * len(check_angles)
+                current_index = 0
+                while not self._stop.is_set():
+                    self._pause.wait()
+                    with self.lock:
+                        packet = ser.read(5)
+                        if len(packet) != 5:
+                            continue
+                        result = parse_packet(packet)
+                        if result is None:
+                            continue
+                        angle, distance_cm, _ = result
+                        angle_rounded = round(angle)
+                        target_angle = check_angles[current_index]
+                        if abs(angle_rounded - target_angle) <= 1:
+                            temp_array[current_index] = round(distance_cm, 1)
+                            current_index += 1
+                            if current_index >= len(check_angles):
+                                current_index = 0
+                                lidar_string = "LIDAR:" + ",".join(map(str, temp_array))
+                                try:
+                                    client_sock.send((lidar_string + "\n").encode("utf-8"))
+                                except Exception as e:
+                                    print("[AGV] Failed to send LIDAR data:", e)
+        except Exception as e:
+            print("[AGV] LIDAR error:", e)
+
+    def exclusive_sweep(self):
+        self.pause()
+        with self.lock:
+            try:
+                with serial.Serial(LIDAR_PORT, LIDAR_BAUDRATE, timeout=1) as ser:
+                    ser.write(CMD_STOP)
+                    time.sleep(0.2)
+                    ser.reset_input_buffer()
+                    ser.write(CMD_SCAN)
+                    get_descriptor(ser)
+                    scan = [0] * 360
+                    received = 0
+                    start_time = time.time()
+                    MIN_REQUIRED = 320
+                    while received < 360 and time.time() - start_time < 5.5:
+                        packet = ser.read(5)
+                        result = parse_packet(packet)
+                        if result:
+                            angle, distance_cm, _ = result
+                            angle_index = int(round(angle)) % 360
+                            if scan[angle_index] == 0 and distance_cm > 0:
+                                scan[angle_index] = distance_cm
+                                received += 1
+                    if received >= MIN_REQUIRED:
+                        print(f"[AGV] Sweep collected {received}/360 points")
+                        return scan
+                    else:
+                        print(f"[AGV] Incomplete LIDAR sweep: {received}/360")
+                        return None
+            except Exception as e:
+                print("[AGV] LIDAR sweep error:", e)
+                return None
+        self.resume()
+
+lidar_mgr = LidarManager()
+client_sock_ref = None  # Set on connection
+
+# --- THE REST OF YOUR CODE (unchanged, except for LIDAR USAGE) ---
+
+def get_descriptor(ser):
+    descriptor = ser.read(7)
+    if descriptor[:2] != b'\xA5\x5A':
+        raise Exception("Misslyckades med att ta emot scan descriptor")
+
+def update_position(new_x, new_y):
+    global x, y
+    with position_lock:
+        x, y = new_x, new_y
+
+def get_position():
+    global x, y
+    with position_lock:
+        return x, y
+
+def parse_packet(packet):
+    if len(packet) != 5:
+        return None
+    b0, b1, b2, b3, b4 = struct.unpack('<BBBBB', packet)
+    start_flag = b0 & 0x01
+    inverted_start_flag = (b0 >> 1) & 0x01
+    if start_flag != (~inverted_start_flag & 0x01):
+        return None
+    quality = b0 >> 2
+    angle_q6 = ((b2 << 7) | (b1 >> 1))
+    angle = (angle_q6 / 64.0) % 360
+    dist_q2 = (b4 << 8) | b3
+    distance_cm = round((dist_q2 / 4.0) / 10.0)
+    return angle, max(0, distance_cm), quality
+
+# Remove lidar_busy, lidar_active, and lidar_thread global vars!
+
+def wait_for_lidar_idle(timeout=5.0):
+    # Not needed in the new version, but kept for compatibility
+    return True
+
+def capture_lidar_sweep():
+    return lidar_mgr.exclusive_sweep()
+
+# The rest of your code - update all places that start/stop lidar threads or access lidar_active/lidar_busy
+# Example: replace lidar_thread = threading.Thread(target=lidar_task, ...) with lidar_mgr.start(...)
+# Replace lidar_active = False/True with lidar_mgr.pause()/lidar_mgr.resume()
+# For exclusive sweep: use capture_lidar_sweep()
+
+def send_move_commands(esp_serial, target_x, target_y, angle):
+    global client_sock_ref
+    try:
+        target_x = float(target_x)
+        target_y = float(target_y)
+        angle = float(angle)
+    except ValueError as e:
+        print(f"[AGV] Error parsing coordinates: {e}")
+        return
+
+    current_x, current_y = get_position()
+    dx = target_x - x
+    dy = target_y - y
+
+    if angle != 0:
+        lidar_mgr.pause()
+
+        print("[AGV] Waiting for robot to settle before reference sweep...")
+        time.sleep(0.7)
+        sweep_before = capture_lidar_sweep()
+    else:
+        sweep_before = None
+
+    # Rotation command
+    if angle == 0:
+        esp_serial.write(b'0')
+        time.sleep(1)
+    elif angle == 45:
+        esp_serial.write(b'2')
+        time.sleep(1)
+    elif angle == 90:
+        esp_serial.write(b'3')
+        time.sleep(1)
+    elif angle == 135:
+        esp_serial.write(b'4')
+        time.sleep(1)
+    elif angle == 180 or angle == -180:
+        esp_serial.write(b'5')
+        time.sleep(1)
+    elif angle == -45:
+        esp_serial.write(b'6')
+        time.sleep(1)
+    elif angle == -90:
+        esp_serial.write(b'7')
+        time.sleep(1)
+    elif angle == -135:
+        esp_serial.write(b'8')
+        time.sleep(1)
+    else:
+        esp_serial.write(b'9')
+        
+    print("[AGV] Waiting for robot to settle after rotation...")
+    time.sleep(0.7)
+
+    if angle != 0 and sweep_before:
+        sweep_after = capture_lidar_sweep()
+        if sweep_after:
+            shift = estimate_rotation_error(sweep_before, sweep_after, angle=angle, window=20)
+            print(f"[AGV] Rotation mismatch: {shift} degrees")
+            while abs(shift) > 3:
+                if shift > 0:
+                    esp_serial.write(b'b')  # rotate backward
+                else:
+                    esp_serial.write(b'a')  # rotate forward
+                time.sleep(0.4)
+                print("[AGV] Waiting before correction sweep...")
+                time.sleep(0.7)
+                sweep_after = capture_lidar_sweep()
+                shift = estimate_rotation_error(sweep_before, sweep_after, angle=angle, window=20)
+                print(f"[AGV] Adjusted rotation, new diff: {shift}")
+
+    # Resume lidar after exclusive sweep
+    if client_sock_ref:
+        print("[AGV] Restarting lidar_task after rotation...")
+        lidar_mgr.resume()
+
+    time.sleep(3)
+    esp_serial.write(b'0')  
+    while abs(dx) > 20 or abs(dy) > 20:
+        current_x, current_y = get_position()
+        print(f"[DEBUG] dx={dx}, dy={dy}, entering while?")
+        print("HÄR")
+        dx = target_x - x
+        dy = target_y - y
+        time.sleep(1)
+        esp_serial.write(b'9')
+        time.sleep(1)
+        esp_serial.write(b'0')
+
+    if abs(dx) <= 20 and abs(dy) <= 20:
+        print(f"[AGV] Nra mlet: dx={dx}, dy={dy}, skickar kommando 9 (stopp)")
+        esp_serial.write(b'9')
+        time.sleep(2)
+        print(f"[AGV] Mlet ntt: dx={dx}, dy={dy}, skickar kommando 9")
+        return
+
+# --- Bluetooth server loop: update lidar thread usage ---
+server_sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+server_sock.bind(("", bluetooth.PORT_ANY))
+server_sock.listen(1)
+port = server_sock.getsockname()[1]
+print(f"[AGV] Bluetooth-server startad på port {port}. Väntar på anslutning...")
+
+try:
+    while True:
+        client_sock, client_info = server_sock.accept()
+        print(f"[AGV] Klient ansluten: {client_info}")
+        data_buffer = ""
+        try:
+            while True:
+                data = client_sock.recv(1024).decode("utf-8")
+                if not data:
+                    break
+                data_buffer += data
+                lines = data_buffer.strip().splitlines()
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    print(f"[AGV] Mottaget: {line}")
+                    if line.startswith("GT"):
+                        coords = line.replace("GT,", "").split(",")
+                        target_x, target_y, V = coords if len(coords) == 3 else ("0", "0", "0")
+                        threading.Thread(target=send_move_commands, args=(esp_serial, target_x, target_y, V), daemon=True).start()
+                    elif line == "lidar":
+                        client_sock_ref = client_sock
+                        lidar_mgr.start(client_sock)
+                    elif line == "STOP":
+                        esp_serial.write(b'9')
+                    elif line == "R":
+                        print("[AGV] Startar lyssning efter 'ACK: UPG_klar'...")
+                        start_time = time.time()
+                        timeout = 15.0
+                        while time.time() - start_time < timeout:
+                            if esp_serial.in_waiting:
+                                response = esp_serial.readline().decode("utf-8").strip()
+                                print(f"[ESP] ? {response}")
+                            if response == "ACK: UPG_klar":
+                                print("[AGV] Mottog korrekt ACK, skickar 'c'")
+                                esp_serial.write(b'c')
+                                break
+                    elif line == "position":
+                        threading.Thread(target=dwm_position_task, args=(client_sock,), daemon=True).start()
+                data_buffer = ""
+        except OSError as e:
+            print(f"[AGV] Anslutning avslutad ({e})")
+        finally:
+            client_sock.close()
+            print("[AGV] Väntar på ny anslutning...")
+except KeyboardInterrupt:
+    print("[AGV] Avslutar Bluetooth-server...")
+    server_sock.close()
+    esp_serial.close()
