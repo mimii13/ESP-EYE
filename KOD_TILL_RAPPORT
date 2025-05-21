@@ -490,7 +490,7 @@ def send_move_commands(esp_serial, target_x, target_y, angle):
     lidar_active = True
     time.sleep(3)
     esp_serial.write(b'0')  
-    while abs(dx) > 20 and abs(dy) > 20:
+    while abs(dx) > 20 or abs(dy) > 20:
         current_x, current_y = get_position()
         print(f"[DEBUG] dx={dx}, dy={dy}, entering while?")
         print("HÃR")
