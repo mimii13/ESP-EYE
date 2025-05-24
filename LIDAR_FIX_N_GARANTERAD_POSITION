@@ -49,7 +49,7 @@ class LidarManager:
         self.lock = threading.Lock()
         self.thread = None
         self.client_sock = None
-
+        
     def start(self, client_sock):
         if self.thread is not None and self.thread.is_alive():
             return
@@ -69,7 +69,7 @@ class LidarManager:
 
     def resume(self):
         self._pause.set()
-
+        
     def _run(self, client_sock):
         try:
             with serial.Serial(LIDAR_PORT, LIDAR_BAUDRATE, timeout=1) as ser:
@@ -100,11 +100,12 @@ class LidarManager:
                                 lidar_string = "LIDAR:" + ",".join(map(str, temp_array))
                                 try:
                                     client_sock.send((lidar_string + "\n").encode("utf-8"))
+                                    print(lidar_string)
                                 except Exception as e:
                                     print("[AGV] Failed to send LIDAR data:", e)
         except Exception as e:
             print("[AGV] LIDAR error:", e)
-
+            
     def exclusive_sweep(self):
         self.pause()
         result = None
@@ -119,7 +120,7 @@ class LidarManager:
                     scan = [0] * 360
                     received = 0
                     start_time = time.time()
-                    MIN_REQUIRED = 320
+                    MIN_REQUIRED = 200
                     while received < 360 and time.time() - start_time < 5.5:
                         packet = ser.read(5)
                         result_packet = parse_packet(packet)
@@ -135,6 +136,7 @@ class LidarManager:
                     else:
                         print(f"[AGV] Incomplete LIDAR sweep: {received}/360")
                         result = None
+                        
             except Exception as e:
                 print("[AGV] LIDAR sweep error:", e)
                 result = None
@@ -187,21 +189,23 @@ def get_descriptor(ser):
     descriptor = ser.read(7)
     if descriptor[:2] != b'\xA5\x5A':
         raise Exception("Misslyckades med att ta emot scan descriptor")
-
+        
 # --- POSITION HANDLING FUNCTIONS ---
 def update_position(raw_x, raw_y):
     """Apply offsets and rounding ONCE, and update the shared position."""
-    pos_x = round(raw_x + 16.0, 1)
-    pos_y = round(raw_y + 13.0, 1)
+    pos_x = round(raw_x, 1)
+    pos_y = round(raw_y, 1)
     with position_lock:
         current_pos["x"] = pos_x
         current_pos["y"] = pos_y
-
+        
 def send_position_to_parent(client_sock):
     with position_lock:
         pos_x = current_pos["x"]
         pos_y = current_pos["y"]
     client_sock.send(f"POS:{pos_x},{pos_y}\r\n".encode("utf-8"))
+    print(pos_x, "\n")
+    print(pos_y, "\n")
 
 def get_current_position():
     with position_lock:
@@ -224,11 +228,11 @@ def parse_packet(packet):
 
 def wait_for_lidar_idle(timeout=5.0):
     return True
-
+    
 def capture_lidar_sweep():
     return lidar_mgr.exclusive_sweep()
-
-def estimate_rotation_error(before, after, angle=0, window=30):
+    
+def estimate_rotation_error(before, after, angle=0, window=20):
     best_shift = angle
     best_score = float('-inf')
     for shift in range(int(angle - window), int(angle + window + 1)):
@@ -246,7 +250,6 @@ def estimate_rotation_error(before, after, angle=0, window=30):
     return best_shift - angle
 
 def stabilize_position(new_x, new_y):
-    # No longer needed for logic, but preserved for Kalman output smoothing
     return new_x, new_y
 
 def mean_position():
@@ -255,7 +258,7 @@ def mean_position():
     mean_x = sum(position_buffer_x) / len(position_buffer_x)
     mean_y = sum(position_buffer_y) / len(position_buffer_y)
     return round(mean_x), round(mean_y)
-
+    
 def dwm_position_task(client_sock):
     ax, ay = 0.0, 0.0
     try:
@@ -313,7 +316,7 @@ def dwm_position_task(client_sock):
                                 print("[Kalman] Fel vid positionsberkning:", e)
     except Exception as e:
         print("[AGV] DWM-fel:", e)
-
+        
 def send_move_commands(esp_serial, target_x, target_y, angle):
     global client_sock_ref
     try:
@@ -323,12 +326,14 @@ def send_move_commands(esp_serial, target_x, target_y, angle):
     except ValueError as e:
         print(f"[AGV] Error parsing coordinates: {e}")
         return
-    threshold = 20
+    threshold_X = 11
+    threshold_Y = 13
     if angle != 0:
         lidar_mgr.pause()
         print("[AGV] Waiting for robot to settle before reference sweep...")
         time.sleep(0.7)
         sweep_before = capture_lidar_sweep()
+        #print(sweep_before)
     else:
         sweep_before = None
     if angle == 0:
@@ -358,11 +363,12 @@ def send_move_commands(esp_serial, target_x, target_y, angle):
     else:
         esp_serial.write(b'9')
     print("[AGV] Waiting for robot to settle after rotation...")
-    time.sleep(0.7)
+    time.sleep(0.5)
     if angle != 0 and sweep_before:
         sweep_after = capture_lidar_sweep()
         if sweep_after:
             shift = estimate_rotation_error(sweep_before, sweep_after, angle=angle, window=20)
+            #print(sweep_after)
             print(f"[AGV] Rotation mismatch: {shift} degrees")
             while abs(shift) > 3:
                 if shift > 0:
@@ -380,28 +386,42 @@ def send_move_commands(esp_serial, target_x, target_y, angle):
         lidar_mgr.resume()
     time.sleep(3)
     esp_serial.write(b'0')
+    
     while True:
         pos_x, pos_y = get_current_position()
         dx = target_x - pos_x
         dy = target_y - pos_y
-        print(f"[DEBUG] dx={dx}, dy={dy}, entering while?")
-        print("HÄR")
-        if abs(dx) <= threshold and abs(dy) <= threshold:
-            print(f"[AGV] Nra mlet: dx={dx}, dy={dy}, skickar kommando 9 (stopp)")
-            esp_serial.write(b'9')
-            time.sleep(2)
-            print(f"[AGV] Mlet ntt: dx={dx}, dy={dy}, skickar kommando 9")
-            return
-        time.sleep(1)
-        esp_serial.write(b'9')
-        time.sleep(1)
+        print(f"[DEBUG] dx={dx}, dy={dy}, checking proximity...")
+
+        if abs(dx) <= threshold_X and abs(dy) <= threshold_Y:
+            print(f"[AGV] NÃ¤ra mÃ¥let: dx={dx}, dy={dy}, skickar 'Target_reached'")
+            esp_serial.write(b'9')  # STOP
+            time.sleep(1)
+
+            if client_sock_ref:
+                try:
+                    client_sock_ref.send(b"Target_reached\n")
+                    print("[AGV] Skickade 'Target_reached' till klient")
+                except Exception as e:
+                    print(f"[AGV] Kunde inte skicka 'Target_reached': {e}")
+            break
+
+        time.sleep(0.5)
         esp_serial.write(b'0')
 
+    print(f"[AGV] Mlet ntt: dx={dx}, dy={dy}, skickar kommando 9")
+    esp_serial.write(b'9')
+    return
+        # time.sleep(1)
+        # esp_serial.write(b'9')
+        # time.sleep(1)
+        # esp_serial.write(b'0')
+        
 server_sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
 server_sock.bind(("", bluetooth.PORT_ANY))
 server_sock.listen(1)
 port = server_sock.getsockname()[1]
-print(f"[AGV] Bluetooth-server startad på port {port}. Väntar på anslutning...")
+print(f"[AGV] Bluetooth-server startad pÃ¥ port {port}. VÃ¤ntar pÃ¥ anslutning...")
 
 try:
     while True:
@@ -431,16 +451,17 @@ try:
                         esp_serial.write(b'9')
                     elif line == "R":
                         print("[AGV] Startar lyssning efter 'ACK: UPG_klar'...")
+                        esp_serial.write(b'R')
                         start_time = time.time()
-                        timeout = 15.0
+                        timeout = 20.0
                         while time.time() - start_time < timeout:
                             if esp_serial.in_waiting:
                                 response = esp_serial.readline().decode("utf-8").strip()
                                 print(f"[ESP] ? {response}")
-                            if response == "ACK: UPG_klar":
-                                print("[AGV] Mottog korrekt ACK, skickar 'c'")
-                                esp_serial.write(b'c')
-                                break
+                                if response == "ACK: UPG klar":
+                                    print("[AGV] Mottog korrekt ACK, skickar 'c'")
+                                    esp_serial.write(b'c')
+                                    break
                     elif line == "position":
                         threading.Thread(target=dwm_position_task, args=(client_sock,), daemon=True).start()
                 data_buffer = ""
@@ -448,7 +469,7 @@ try:
             print(f"[AGV] Anslutning avslutad ({e})")
         finally:
             client_sock.close()
-            print("[AGV] Väntar på ny anslutning...")
+            print("[AGV] VÃ¤ntar pÃ¥ ny anslutning...")
 except KeyboardInterrupt:
     print("[AGV] Avslutar Bluetooth-server...")
     server_sock.close()
