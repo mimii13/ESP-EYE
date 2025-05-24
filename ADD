@@ -1,6 +1,7 @@
-bt.targetReached = false;
-while (!bt.targetReached) {
+bt.ackReceived = false;
+bt.sendLjusCommand();
+System.out.println("🔄 Skickade R");
+while (!bt.ackReceived) {
     try { Thread.sleep(50); } catch (InterruptedException e) {}
 }
-nodeReached = true; // Nu har Target_reached tagits emot!
-bt.targetReached = false; // Återställ för säkerhets skull
+bt.ackReceived = false;
