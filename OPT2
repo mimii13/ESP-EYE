@@ -445,6 +445,44 @@ ds.path.clear();
 
 
     }
-    
+
+cd /home/kts/NetBeansProjects/AUTONAVIGATE; JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 /usr/lib/apache-netbeans/java/maven/bin/mvn -Dexec.vmArgs= "-Dexec.args=${exec.vmArgs} -classpath %classpath ${exec.mainClass} ${exec.appArgs}" -Dexec.appArgs= -Dexec.mainClass=autonavigate.AutoNavigate -Dexec.executable=/usr/lib/jvm/java-21-openjdk-amd64/bin/java --no-transfer-progress process-classes org.codehaus.mojo:exec-maven-plugin:3.1.0:exec
+Scanning for projects...
+
+---------------------< com.mycompany:AUTONAVIGATE >---------------------
+Building AUTONAVIGATE 1.0-SNAPSHOT
+  from pom.xml
+--------------------------------[ jar ]---------------------------------
+
+--- resources:3.3.1:resources (default-resources) @ AUTONAVIGATE ---
+skip non existing resourceDirectory /home/kts/NetBeansProjects/AUTONAVIGATE/src/main/resources
+
+--- compiler:3.11.0:compile (default-compile) @ AUTONAVIGATE ---
+Changes detected - recompiling the module! :source
+Compiling 12 source files with javac [debug target 21] to target/classes
+-------------------------------------------------------------
+COMPILATION ERROR : 
+-------------------------------------------------------------
+autonavigate/OptPlan.java:[443,14] <identifier> expected
+1 error
+-------------------------------------------------------------
+------------------------------------------------------------------------
+BUILD FAILURE
+------------------------------------------------------------------------
+Total time:  1.309 s
+Finished at: 2025-05-24T13:27:55+02:00
+------------------------------------------------------------------------
+Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.11.0:compile (default-compile) on project AUTONAVIGATE: Compilation failure
+autonavigate/OptPlan.java:[443,14] <identifier> expected
+
+-> [Help 1]
+
+To see the full stack trace of the errors, re-run Maven with the -e switch.
+Re-run Maven using the -X switch to enable full debug logging.
+
+For more information about the errors and possible solutions, please read the following articles:
+[Help 1] http://cwiki.apache.org/confluence/display/MAVEN/MojoFailureException
+
+
 
     
