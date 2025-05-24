@@ -1,0 +1,807 @@
+package autonavigate;
+
+import javax.microedition.io.Connector;
+import javax.microedition.io.StreamConnection;
+import java.io.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.swing.SwingUtilities;
+
+public class BluetoothClient {
+
+    private static final String AGV_URL = "btspp://b827eb7bd6ad:1;authenticate=false;encrypt=false;master=false"; // 
+
+    private StreamConnection connection;
+    private PrintWriter writer;
+    private BufferedReader reader;
+    private ControlUIny gui;
+    private DataStore ds;
+    private final List<int[]> lastLidarPoints = new ArrayList<>();
+    private AutoNavigate an;
+    private MapPanel mp;
+    private double headingOffset = 0.0;
+    private boolean initialRouteCalculated = false;
+    private final Object routeLock = new Object();
+    private double lastValidX = -1;
+private double lastValidY = -1;
+private final List<double[]> lidarHistory = new LinkedList<>();
+
+
+    public BluetoothClient(ControlUIny gui, DataStore ds, AutoNavigate an) {
+        this.gui = gui;
+        this.ds = ds;
+        this.an = an;
+       
+        
+    }
+
+    public void connect() {
+        try {
+            gui.appendStatus("🔌 Ansluter till AGV...\n");
+
+            connection = (StreamConnection) Connector.open(AGV_URL);
+            OutputStream out = connection.openOutputStream();
+            InputStream in = connection.openInputStream();
+
+            writer = new PrintWriter(out, true);
+            reader = new BufferedReader(new InputStreamReader(in));
+
+            gui.appendStatus("✅ Ansluten! Anslutningen är öppen.\n");
+             
+      //  gui.appendStatus("📡 Skickade 'position' till AGV för att starta DWM-positionering...\n");
+
+        // 🟢 Starta lyssning för DWM-positioner
+        
+
+
+        } catch (Exception e) {
+            gui.appendStatus("❌ Anslutningsfel: " + e.getMessage() + "\n");
+            e.printStackTrace();
+        }
+    }
+    public void sendPositionCommand() {
+    if (!isConnected()) return;
+    writer.println("position");
+    writer.flush();
+    gui.appendStatus("? Skickade 'position' till AGV.\n");
+}
+
+// Skickar "lidar" manuellt
+public void sendLidarCommand() {
+    if (!isConnected()) return;
+    writer.println("lidar");
+    writer.flush();
+    gui.appendStatus("? Skickade 'lidar' till AGV.\n");
+}
+
+public void sendLjusCommand() {
+    if (!isConnected()) return;
+    writer.println("R");
+    writer.flush();
+    gui.appendStatus("? Skickade 'ljus' till AGV.\n");
+}
+
+    public void ping() {
+    if (connection == null || writer == null) {
+        gui.appendStatus("❌ Ingen anslutning. Kan inte pinga.\n");
+        return;
+    }
+    try {
+        writer.println("ping");
+        
+        writer.flush();          // Säkerställ att det verkligen går ut!
+
+        gui.appendStatus("✅ Anslutning OK. Ping skickad.\n");
+    } catch (Exception e) {
+        gui.appendStatus("❌ Anslutning förlorad: " + e.getMessage() + "\n");
+    }
+}
+
+public void receiveLidarData() {
+    if (!isConnected()) {
+        gui.appendStatus("❌ Inte ansluten till AGV.\n");
+        return;
+    }
+
+    an.startRouteplanning(); // Initial planering
+
+    try {
+        writer.println("lidar");
+        gui.repaint();
+        gui.appendStatus("📡 Startar mottagning av LIDAR-data...\n");
+
+        while (true) {
+            String line = reader.readLine();
+            if (line == null) break;
+
+            if (line.startsWith("LIDAR:")) {
+                boolean blockerat = false;
+
+                // Rensa gamla hinder
+                System.out.println(line);
+                String[] parts = line.substring(6).split(",");
+                if (parts.length != 360) {
+                    gui.appendStatus("⚠️ Felaktig LIDAR-vektor (inte 360 värden).\n");
+                    continue;
+                }
+
+                for (int i = 0; i < parts.length; i++) {
+                    try {
+                        double angleRad = Math.toRadians(i);
+                        double distance = Double.parseDouble(parts[i].trim());
+
+                        if (distance <= 10.0 || distance == 0.0) continue;
+
+                        double obsX = ds.robotX + distance * Math.cos(angleRad);
+                        double obsY = ds.robotY + distance * Math.sin(angleRad);
+
+                        int row = (int) Math.round(obsY / ds.gridsize);
+                        int col = (int) Math.round(obsX / ds.gridsize);
+
+                        if (row >= 0 && row < ds.rows && col >= 0 && col < ds.columns) {
+                            // 💡 Kontrollera om detta nya hinder blockerar rutten (ObstacleMatrix == 3)
+                            if (ds.ObstacleMatrix[row][col] == 3) {
+                                blockerat = true;
+                            }
+                            ds.ObstacleMatrix[row][col] = 1;
+                            lastLidarPoints.add(new int[]{row, col});
+                        }
+
+                    } catch (NumberFormatException e) {
+                        gui.appendStatus("⚠️ Ogiltigt LIDAR-värde vid index " + i + "\n");
+                    }
+                }
+
+                ds.buildObstaclesFromMapping();
+                gui.repaint();
+
+                if (blockerat) {
+                    gui.appendStatus("🛑 Rutt blockerad – skickar STOP...\n");
+                 //   writer.println("stop");
+                    writer.flush();
+                     for (int i = 0; i < ds.rows; i++) {
+                         for (int j = 0; j < ds.columns; j++) {
+                             if (ds.ObstacleMatrix[i][j] == 3 )
+                             {
+                                 ds.ObstacleMatrix[i][j] = 0;
+                             }
+                         }
+                     }
+                    gui.appendStatus("🔄 Räknar om rutt...\n");
+                    an.startMapplanning();
+                    gui.repaint();
+
+                 //   try {
+                   //     Thread.sleep(2000);
+                  //  } catch (InterruptedException e) {
+                  //      gui.appendStatus("⚠️ Avbrott i väntan: " + e.getMessage() + "\n");
+                    //}
+
+                    gui.appendStatus("📡 Återupptar LIDAR-stream...\n");
+                   // writer.println("lidar");
+                 //   writer.flush();
+                }
+            }
+        }
+
+    } catch (IOException e) {
+        gui.appendStatus("❌ Fel vid LIDAR-mottagning: " + e.getMessage() + "\n");
+    }
+  //  writer.println("stop");
+}
+
+
+
+
+
+    public void transfer() {
+        try {
+            if (!isConnected()) return;
+
+            File commandFile = new File("command.txt");
+            if (!commandFile.exists() || commandFile.length() == 0) {
+                gui.appendStatus("⚠️ Inget att överföra i command.txt.\n");
+                return;
+            }
+
+            List<String> cmds = new ArrayList<>();
+            try (BufferedReader br = new BufferedReader(new FileReader(commandFile))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    cmds.add(line);
+                }
+            }
+
+            for (String cmd : cmds) {
+                gui.appendStatus("➡️ Skickar: " + cmd + "\n");
+                writer.println(cmd);
+                writer.flush();
+            }
+
+            File statusFile = new File("status.txt");
+            try (PrintWriter statusWriter = new PrintWriter(new FileWriter(statusFile))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    gui.appendStatus("✅ Mottaget: " + line + "\n");
+                    statusWriter.println(line);
+                    if (line.contains("klar")) break; // T.ex. signalera slut
+                }
+            }
+
+        } catch (IOException e) {
+            gui.appendStatus("❌ Överföring misslyckades: " + e.getMessage() + "\n");
+        }
+    }
+    
+    public void requestStatus() { //lägg in motsvarande i raspberryn
+    if (!isConnected()) return;
+
+    try {
+        writer.println("status?");
+        String response = reader.readLine();
+        if (response != null) {
+            gui.appendStatus("🔄 Status från AGV: " + response + "\n");
+        }
+    } catch (IOException e) {
+        gui.appendStatus("❌ Fel vid statusförfrågan: " + e.getMessage() + "\n");
+    }
+}
+    private void sanitizePosition() {
+    // Kontrollera om positionen är (0.0, 0.0)
+    if (ds.robotX == 0.0 && ds.robotY == 0.0) {
+        gui.appendStatus("⚠️ Ogiltig position (0.0, 0.0) upptäckt – återställer.\n");
+
+        // Om vi har en tidigare giltig position, använd den
+        if (lastValidX != -1 && lastValidY != -1) {
+            ds.robotX = lastValidX;
+            ds.robotY = lastValidY;
+            gui.appendStatus("🔄 Återställer till senaste giltiga position: (" + lastValidX + ", " + lastValidY + ")\n");
+        } else {
+            // Om ingen giltig position finns, markera som ogiltig
+            ds.robotX = -1;
+            ds.robotY = -1;
+            gui.appendStatus("🚫 Ingen giltig tidigare position – markerar som ogiltig.\n");
+        }
+    } else {
+        // Uppdatera senaste giltiga position
+        lastValidX = ds.robotX;
+        lastValidY = ds.robotY;
+    }
+}
+
+ public void startPositionTracking() {
+    gui.appendStatus("🚀 Startar tråd för positionsuppdatering...\n");
+
+    new Thread(() -> {
+        try {
+            while (true) {
+                String line = reader.readLine();
+                if (line == null) break;
+
+                if (line.startsWith("POS:")) {
+                    String[] parts = line.substring(4).split(",");
+                    if (parts.length >= 2) {
+                        try {
+                            double x = Double.parseDouble(parts[0].trim());
+                            double y = Double.parseDouble(parts[1].trim());
+
+                            ds.robotX = x * 100;
+                            ds.robotY = y * 100;
+                            System.out.println(ds.robotX);
+                            System.out.println(ds.robotY);
+                            gui.appendStatus(String.format("📍 Uppdaterad position: X=%.1f cm, Y=%.1f cm\n", ds.robotX, ds.robotY));
+                            gui.repaint();
+                        } catch (NumberFormatException e) {
+                            gui.appendStatus("⚠️ Kunde inte tolka position: " + e.getMessage() + "\n");
+                        }
+                    }
+                }
+            }
+        } catch (IOException e) {
+            gui.appendStatus("❌ Fel vid läsning av position: " + e.getMessage() + "\n");
+        }
+    }).start();
+}
+// Resetfunktion för att återställa ruttberäkning
+private void resetRouteCalculation() {
+    synchronized (routeLock) {
+        // Återställ ruttberäkningsflaggan
+        initialRouteCalculated = false;
+        // Rensa kopierad ruttlista om den finns
+        if (ds.copypath != null) {
+            ds.copypath.clear();
+        }
+        // Rensa senaste position om den är ogiltig
+        if (ds.robotX == 0.0 && ds.robotY == 0.0) {
+            ds.robotX = -1;
+            ds.robotY = -1;
+        }
+        gui.appendStatus("🔄 Ruttberäkningsflagga och ruttdata återställda.\n");
+    }
+}
+
+
+
+public void startUnifiedReceiver() {
+    if (!isConnected()) return;
+
+    // Återställning vid start
+    
+    gui.appendStatus("🚀 Startar kombinerad mottagning av position och LIDAR...\n");
+
+    new Thread(() -> {
+        try {
+            while (true) {
+                if (reader == null) {
+                    gui.appendStatus("❗ BufferedReader är null – anslutning inte klar?\n");
+                    continue;
+                }
+
+                String line = reader.readLine();
+                if (line == null) {
+                    gui.appendStatus("❗ Strömmen verkar stängd.\n");
+                    break;
+                }
+
+                gui.appendStatus("📨 Mottaget: " + line + "\n");
+
+                // 🗺️ Hantering av positionsdata
+                if (line.startsWith("POS:")) {
+                    new Thread(() -> {
+                    handlePositionData(line);
+                    }).start();
+                }
+
+                // 📡 Hantering av LIDAR-data
+                else if (line.startsWith("LIDAR:")) {
+                    handleLidarData(line);
+                } else {
+                    System.out.println("ℹ️ Okänt meddelande: " + line + "\n");
+
+                    gui.appendStatus("ℹ️ Okänt meddelande: " + line + "\n");
+                }
+            }
+        } catch (IOException e) {
+            gui.appendStatus("❌ Fel vid läsning: " + e.getMessage() + "\n");
+        }
+    }, "BT-Receiver").start();
+}
+
+private void handleLidarData(String line) {
+
+    String[] parts = line.substring(6).split(",");
+    if (parts.length != 360) {
+        gui.appendStatus("⚠️ Felaktig LIDAR-vektor: " + parts.length + " värden\n");
+        return;
+    }
+
+   
+        // 🧹 Rensa tidigare hinderpunkter
+        for (int[] point : lastLidarPoints) {
+            int row = point[0];
+            int col = point[1];
+            if (row >= 0 && row < ds.rows && col >= 0 && col < ds.columns) {
+                if (ds.ObstacleMatrix[row][col] == 1) {
+                    ds.ObstacleMatrix[row][col] = 0;
+                }
+            }
+        }
+        lastLidarPoints.clear();
+
+        // 🔢 Lägg till ny vektor i historiken
+        double[] currentVector = new double[360];
+        for (int i = 0; i < 360; i++) {
+            try {
+                currentVector[i] = Double.parseDouble(parts[i].trim());
+            } catch (NumberFormatException e) {
+                currentVector[i] = 0;
+            }
+        }
+        synchronized (lidarHistory) {
+            lidarHistory.add(currentVector);
+            if (lidarHistory.size() > 5) {
+                lidarHistory.remove(0);
+            }
+        }
+
+        // 🧮 Beräkna medelvärdesvektor
+        double[] avgVector = new double[360];
+        synchronized (lidarHistory) {
+            for (int i = 0; i < 360; i++) {
+                double sum = 0;
+                int count = 0;
+                for (double[] vec : lidarHistory) {
+                    if (vec[i] > 0) {
+                        sum += vec[i];
+                        count++;
+                    }
+                }
+                avgVector[i] = (count > 0) ? sum / count : 0;
+            }
+        }
+
+        boolean blockerat = false;
+
+        for (int i = 0; i < 360; i++) {
+            try {
+                int adjustedAngle = (i - (int) ds.agvDirection) % 360;
+                double angleRad = Math.toRadians(adjustedAngle);
+                double distance = avgVector[i];
+
+                if (distance <= 50.0 || distance >= 200.0 || distance == 0) continue;
+
+                double deltaX = distance * Math.cos(angleRad);
+                double deltaY = distance * Math.sin(angleRad);
+                double obsX = ds.robotX + deltaX;
+                double obsY = ds.robotY - deltaY;
+                int row = (int) (obsY / ds.gridsize);
+                int col = (int) (obsX / ds.gridsize);
+
+                if (row >= 0 && row < ds.rows && col >= 0 && col < ds.columns) {
+                    int currentVal = ds.ObstacleMatrix[row][col];
+                    if (currentVal == 6 || currentVal == 4 || currentVal == 5) continue;
+
+                    if (currentVal == 3) blockerat = true;
+                    ds.ObstacleMatrix[row][col] = 1;
+                    lastLidarPoints.add(new int[]{row, col});
+                }
+
+            } catch (Exception e) {
+                gui.appendStatus("⚠️ LIDAR-processfel vid index " + i + "\n");
+            }
+        }
+
+        gui.repaint();
+
+        if (blockerat) {
+            stopRobot();
+            gui.appendStatus("🛑 Rutt blockerad – roboten stannar.\n");
+            gui.appendStatus("🔄 Räknar om ny rutt...\n");
+            for (int i = 0; i < ds.rows; i++) {
+                for (int j = 0; j < ds.columns; j++) {
+                    if (ds.ObstacleMatrix[i][j] == 3) ds.ObstacleMatrix[i][j] = 0;
+                }
+            }
+            new Thread(() -> {
+                an.startMapplanning();
+                gui.repaint();
+                gui.appendStatus("✅ Ny rutt beräknad – roboten kan återuppta.\n");
+            }).start();
+        }
+    
+}
+
+
+
+private void handlePositionData(String line) {
+    String[] parts = line.substring(4).split(",");
+    if (parts.length >= 2) {
+        try {
+            double x = Double.parseDouble(parts[0].trim());
+            double y = Double.parseDouble(parts[1].trim());
+
+            // Sanitet och uppdatering
+           // sanitizePosition();
+            ds.robotX = x;
+            ds.robotY = y;
+             
+            gui.appendStatus(String.format("📍 Uppdaterad position: X=%.1f cm, Y=%.1f cm\n", ds.robotX, ds.robotY));
+            gui.repaint();
+
+            // Starta ruttberäkning om positionen är giltig och ingen rutt finns
+            if (!initialRouteCalculated && ds.robotX != 0 && ds.robotY != 0) {
+                initialRouteCalculated = true;
+                gui.appendStatus("🗺️ Initierar ruttberäkning...\n");
+                new Thread(() -> {
+                    an.startMapplanning();
+                    gui.repaint();
+                    gui.appendStatus("✅ Initial rutt beräknad.\n");
+                }).start();
+            }
+
+        } catch (NumberFormatException e) {
+            gui.appendStatus("⚠️ Felaktig POS-data: " + line + "\n");
+        }
+    }
+}
+public void startUnifiedReceiver2() {
+    if (!isConnected()) return;
+
+    // Återställning vid start
+    
+    gui.appendStatus("🚀 Startar kombinerad mottagning av position och LIDAR...\n");
+
+    new Thread(() -> {
+        try {
+            while (true) {
+                if (reader == null) {
+                    gui.appendStatus("❗ BufferedReader är null – anslutning inte klar?\n");
+                    continue;
+                }
+
+                String line = reader.readLine();
+                if (line == null) {
+                    gui.appendStatus("❗ Strömmen verkar stängd.\n");
+                    break;
+                }
+
+                gui.appendStatus("📨 Mottaget: " + line + "\n");
+
+                // 🗺️ Hantering av positionsdata
+                if (line.startsWith("POS:")) {
+                    new Thread(() -> {
+                    handlePositionData2(line);
+                    }).start();
+                }
+
+                // 📡 Hantering av LIDAR-data
+                else if (line.startsWith("LIDAR:")) {
+                    new Thread(() -> {
+                    handleLidarData2(line);
+                    }).start();
+                } else {
+                    System.out.println("ℹ️ Okänt meddelande: " + line + "\n");
+
+                    gui.appendStatus("ℹ️ Okänt meddelande: " + line + "\n");
+                }
+            }
+        } catch (IOException e) {
+            gui.appendStatus("❌ Fel vid läsning: " + e.getMessage() + "\n");
+        }
+    }, "BT-Receiver").start();
+}
+
+private void handleLidarData2(String line) {
+    String[] parts = line.substring(6).split(",");
+    if (parts.length != 360) {
+        gui.appendStatus("⚠️ Felaktig LIDAR-vektor: " + parts.length + " värden\n");
+        return;
+    }
+
+    // 🧹 Rensa tidigare hinderpunkter
+    for (int[] point : lastLidarPoints) {
+        int row = point[0];
+        int col = point[1];
+        if (row >= 0 && row < ds.rows && col >= 0 && col < ds.columns) {
+            if (ds.ObstacleMatrix[row][col] == 1) {
+                ds.ObstacleMatrix[row][col] = 0;
+            }
+        }
+    }
+    lastLidarPoints.clear();
+
+    // 🔢 Lägg till ny vektor i historiken
+    double[] currentVector = new double[360];
+    for (int i = 0; i < 360; i++) {
+        try {
+            currentVector[i] = Double.parseDouble(parts[i].trim());
+        } catch (NumberFormatException e) {
+            currentVector[i] = 0;
+        }
+    }
+    synchronized (lidarHistory) {
+        lidarHistory.add(currentVector);
+        if (lidarHistory.size() > 5) {
+            lidarHistory.remove(0);
+        }
+    }
+
+    // 🧮 Beräkna stabilt medelvärde per vinkel
+    double[] avgVector = new double[360];
+    synchronized (lidarHistory) {
+        for (int i = 0; i < 360; i++) {
+            List<Double> valid = new ArrayList<>();
+            for (double[] vec : lidarHistory) {
+                if (vec[i] > 0) valid.add(vec[i]);
+            }
+
+            if (valid.size() >= 3) {
+                double max = Collections.max(valid);
+                double min = Collections.min(valid);
+                if (max - min <= 30.0) {
+                    double sum = 0;
+                    for (double v : valid) sum += v;
+                    avgVector[i] = sum / valid.size();
+                } else {
+                    avgVector[i] = 0;
+                }
+            } else {
+                avgVector[i] = 0;
+            }
+        }
+    }
+
+    boolean blockerat = false;
+
+    for (int i = 0; i < 360; i++) {
+        try {
+            int adjustedAngle = (i - (int) ds.agvDirection) % 360;
+            double angleRad = Math.toRadians(adjustedAngle);
+            double distance = avgVector[i];
+
+            if (distance <= 50.0 || distance >= 200.0 || distance == 0) continue;
+
+            double deltaX = distance * Math.cos(angleRad);
+            double deltaY = distance * Math.sin(angleRad);
+            double obsX = ds.robotX + deltaX;
+            double obsY = ds.robotY - deltaY;
+            int row = (int) (obsY / ds.gridsize);
+            int col = (int) (obsX / ds.gridsize);
+
+            if (row >= 0 && row < ds.rows && col >= 0 && col < ds.columns) {
+                int val = ds.ObstacleMatrix[row][col];
+                if (val == 6 || val == 4 || val == 5) continue;
+                if (val == 3) blockerat = true;
+
+                ds.ObstacleMatrix[row][col] = 1;
+                lastLidarPoints.add(new int[]{row, col});
+            }
+
+        } catch (Exception e) {
+            gui.appendStatus("⚠️ LIDAR-processfel vid index " + i + "\n");
+        }
+    }
+
+    gui.repaint();
+
+    if (blockerat) {
+        stopRobot();
+        gui.appendStatus("🛑 Rutt blockerad – roboten stannar.\n");
+        gui.appendStatus("🔄 Räknar om ny rutt...\n");
+        for (int i = 0; i < ds.rows; i++) {
+            for (int j = 0; j < ds.columns; j++) {
+                if (ds.ObstacleMatrix[i][j] == 3) ds.ObstacleMatrix[i][j] = 0;
+            }
+        }
+       new Thread(() -> {
+            an.startRouteplanning();
+            gui.repaint();
+            gui.appendStatus("✅ Ny rutt beräknad – roboten kan återuppta.\n");
+        }).start();
+    }
+}
+public void waitForTargetReached() {
+   // new Thread(() -> {
+    try {
+        String line;
+        while ((line = reader.readLine()) != null) {
+            if (line.trim().equals("Target_reached")) {
+                System.out.println("✅ AGV har nått målet!");
+                break;
+            }
+        }
+    } catch (IOException e) {
+        gui.appendStatus("❌ Fel vid väntan på 'Target_reached': " + e.getMessage());
+    }
+   // }).start();
+}
+
+// denna
+public void clearLidarHistory() {
+    synchronized (lidarHistory) {
+        lidarHistory.clear();
+    }
+    gui.appendStatus("🧹 Rensar LIDAR historik efter rotation.\n");
+}
+
+
+private void handlePositionData2(String line) {
+    String[] parts = line.substring(4).split(",");
+    if (parts.length >= 2) {
+        try {
+            double x = Double.parseDouble(parts[0].trim());
+            double y = Double.parseDouble(parts[1].trim());
+
+            // Sanitet och uppdatering
+           // sanitizePosition();
+            ds.robotX = x;
+            ds.robotY = y;
+             
+            gui.appendStatus(String.format("📍 Uppdaterad position: X=%.1f cm, Y=%.1f cm\n", ds.robotX, ds.robotY));
+            gui.repaint();
+
+            // Starta ruttberäkning om positionen är giltig och ingen rutt finns
+            if (!initialRouteCalculated && ds.robotX != 0 && ds.robotY != 0) {
+                initialRouteCalculated = true;
+                gui.appendStatus("🗺️ Initierar ruttberäkning...\n");
+                
+                    an.startRouteplanning();
+                    gui.repaint();
+                    gui.appendStatus("✅ Initial rutt beräknad.\n");
+                
+            }
+
+        } catch (NumberFormatException e) {
+            gui.appendStatus("⚠️ Felaktig POS-data: " + line + "\n");
+        }
+    }
+}
+
+ public void sendDirection(String dir) {
+    if (!isConnected()) return;
+    writer.println(dir);
+    writer.flush();
+    
+}
+public boolean waitForAck() {
+    int timeoutMs = 10000;  // Max väntetid i millisekunder (10 sek)
+    int waited = 0;         // Hur länge vi har väntat
+    int delayMs = 100;      // Intervallet mellan varje läsning
+
+    try {
+        while (waited < timeoutMs) {
+            if (reader.ready()) {
+                String ack = reader.readLine();
+                if ("klar".equalsIgnoreCase(ack.trim())) {
+                    gui.appendStatus("✅ AGV bekräftade steg: klar\n");
+                    return true;
+                } else {
+                    gui.appendStatus("ℹ️ Mottaget annat än klar: " + ack + "\n");
+                }
+            }
+            // Vänta kort innan nästa läsning
+            Thread.sleep(delayMs);
+            waited += delayMs;
+        }
+        // Om vi har väntat för länge utan att få ACK
+        gui.appendStatus("❗ Timeout: Ingen bekräftelse från AGV efter " + (timeoutMs / 1000) + " sekunder.\n");
+        stopRobot();  // Anropa en metod för att stoppa roboten vid timeout
+    } catch (IOException e) {
+        gui.appendStatus("❌ Fel vid väntan på klar: " + e.getMessage() + "\n");
+    } catch (InterruptedException e) {
+        gui.appendStatus("⚠️ Väntan avbruten: " + e.getMessage() + "\n");
+    }
+
+    return false;
+}
+
+private void stopRobot() {
+    try {
+        writer.println("STOP");
+        writer.flush();
+        gui.appendStatus("🚨 Nödstopp skickat till AGV!\n");
+    } catch (Exception e) {
+        gui.appendStatus("❌ Fel vid sändning av nödstopp: " + e.getMessage() + "\n");
+    }
+}
+
+// === NÖDSTOPP ===
+public void emergencyStop() {
+    if (!isConnected()) {
+        gui.appendStatus("❌ Ingen anslutning. Kan inte skicka nödstopp.\n");
+        return;
+    }
+    try {
+        // Skicka nödstoppkommandot "STOP" till AGV
+        writer.println("STOP");
+        writer.flush();
+        gui.appendStatus("🚨 Nödstopp skickat till AGV!\n");
+    } catch (Exception e) {
+        gui.appendStatus("❌ Fel vid sändning av nödstopp: " + e.getMessage() + "\n");
+    }
+}
+
+
+
+
+    private boolean isConnected() {
+        if (connection == null || writer == null || reader == null) {
+            gui.appendStatus("⚠️ Inte ansluten till AGV. Tryck på Anslut först.\n");
+            return false;
+        }
+        return true;
+    }
+
+    public void disconnect() {
+        try {
+            if (connection != null) connection.close();
+            gui.appendStatus("🔌 Anslutningen stängd.\n");
+        } catch (IOException e) {
+            gui.appendStatus("⚠️ Fel vid frånkoppling: " + e.getMessage() + "\n");
+        }
+    }
+}
