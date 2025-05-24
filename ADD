@@ -1,0 +1,7 @@
+if (line.trim().equals("Target_reached")) {
+    targetReached = true; // <-- Sätt flagga!
+    gui.appendStatus("✅ AGV har nått målet!\n");
+} else if (line.trim().equalsIgnoreCase("klar")) {
+    ackReceived = true;   // <-- Sätt flagga!
+    gui.appendStatus("✅ AGV bekräftade steg: klar\n");
+}
