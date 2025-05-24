@@ -400,10 +400,7 @@ for (int i = 0; i < ds.path.size() - 1;) {
 
        
         
-        
-       
-    }
-     if (finalRow == sistaNodenX && finalCol == sistaNodenY) {
+             if (finalRow == sistaNodenX && finalCol == sistaNodenY) {
             //bt.sendLjusCommand(); // LÄD OPTPLAN
             //System.out.println("🔄 Skickade R");
             //bt.waitForAck(); // väntar på UPG_klar t.ex.
@@ -431,6 +428,9 @@ for (int i = 0; i < ds.path.size() - 1;) {
     // Gå vidare till nästa nod
     i += length;
     k = k +1;
+       
+    }
+
 }
 
 
