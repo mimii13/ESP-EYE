@@ -1,3 +1,6 @@
-// --- Lägg till dessa flaggor ---
-public volatile boolean targetReached = false;
-public volatile boolean ackReceived = false;
+bt.targetReached = false;
+while (!bt.targetReached) {
+    try { Thread.sleep(50); } catch (InterruptedException e) {}
+}
+nodeReached = true; // Nu har Target_reached tagits emot!
+bt.targetReached = false; // Återställ för säkerhets skull
