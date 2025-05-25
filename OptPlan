@@ -1,0 +1,466 @@
+ /*
+ * Click nbfs://nbhost/SystemFileSystem/Templates/Licenses/license-default.txt to change this license
+ * Click nbfs://nbhost/SystemFileSystem/Templates/Classes/Class.java to edit this template
+ */
+package autonavigate;
+
+import java.util.ArrayList;
+import java.util.LinkedList;
+import java.util.List;
+import java.io.*;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+
+    
+
+       
+
+
+/**
+ *
+ * @author christianchamaly
+ */
+public class OptPlan {
+    private List<Vertex> nodes;
+    private List<Edge> edges;
+    private DataStore ds;
+   private BluetoothClient bt;
+   private ControlUIny gui;
+ //  private List<String> visitedPoints = new ArrayList<>();
+    double[] LocationX2;
+    double[] LocationY2; 
+    boolean[] visitedPoints = new boolean[8];  // ds.locations = antal besökspunkter
+   int currentTargetIndex = 0;
+
+    
+        
+   
+    
+    public OptPlan(DataStore ds, BluetoothClient bt) {
+        this.ds = ds;
+        this.bt = bt;
+        
+    
+ 
+    }
+
+    // Funktion som översätter väderstreck till vinkel
+private double getRotationFromDirection(char riktning) {
+    switch (riktning) {
+        case 'N': return 90.0;
+        case 'E': return 0.0;
+        case 'S': return 270.0;
+        case 'W': return 180.0;
+        default: 
+            System.out.println("⚠️ Okänd riktning: " + riktning);
+            return 0.0; // Standardvärde om inget matchar
+    }
+}
+
+
+    private boolean isVisited(int x, int y) {
+    for (int i = 0; i < ds.locations; i++) {
+        if ((int)(ds.LocationX[i] / ds.gridsize) == x && (int)(ds.LocationY[i] / ds.gridsize) == y) {
+            return true;
+        }
+    }
+    return false;
+}
+  private double calculateRotation(double currentDirection, double directionV) {
+    double rotation = directionV - currentDirection;
+    // Justera rotation till intervallet [-180, 180]
+    if (rotation >= 180) rotation -= 360;
+    if (rotation <= -180) rotation += 360;
+    return rotation;
+}
+  private void updateDirection(double newDirection) {
+    ds.agvDirection = newDirection % 360;
+    if (ds.agvDirection < 0) ds.agvDirection += 360;
+    System.out.println("🔄 Uppdaterad riktning: " + ds.agvDirection);
+}
+
+
+
+
+    
+    public void createPlan1(){
+       
+    
+
+
+ int k = 1;
+         nodes = new ArrayList<Vertex>();
+         edges = new ArrayList<Edge>();
+         
+         
+// Set up grid network for path finding
+for (int i = 0; i < ds.columns; i++) { 
+   for (int j = 0; j < ds.rows; j++) {
+     
+        Vertex location = new Vertex("" + (i*ds.rows + j), "Nod #" + (i*ds.rows + j)); ;
+        nodes.add(location);
+    }
+}
+System.out.println("columns: "+ds.columns);
+System.out.println("rows: "+ds.rows);
+
+double cost = 1;
+
+
+for (int i = 0; i < ds.rows; i++) {
+  for (int j = 0; j < ds.columns - 1 ; j++) { // Add horizontal links in both directions
+      cost = 1;
+        if (ds.ObstacleMatrix[i][j] != 0 || ds.ObstacleMatrix[i][j + 1] != 0) {
+            continue;
+        }    
+
+      Edge dirA = new Edge("r" + nodes.get(i*ds.columns + j), nodes.get(i*ds.columns + j ), nodes.get(i*ds.columns + j + 1), cost);
+      edges.add(dirA);
+      Edge dirB = new Edge("l" + nodes.get(i*ds.columns + j), nodes.get(i*ds.columns + j + 1), nodes.get(i*ds.columns + j), cost);
+      edges.add(dirB);
+      if(i < ds.rows - 1 ){
+          cost = 500;
+          if(ds.ObstacleMatrix[i + 1][j + 1] != 0){
+              continue;
+          }
+          Edge dirC = new Edge("1d" + nodes.get(i*ds.columns + j), nodes.get(i*ds.columns + j ), nodes.get((i+1)*ds.columns + j + 1), cost);
+          edges.add(dirC);
+          Edge dirD = new Edge("2d" + nodes.get(i*ds.columns + j), nodes.get((i+1)*ds.columns + j + 1), nodes.get(i*ds.columns + j), cost);
+          edges.add(dirD); }
+      if(i > 0){ 
+          cost = 500;
+          if(ds.ObstacleMatrix[i - 1][j + 1] != 0){
+              continue;
+          }
+      Edge dirE = new Edge("3d" + nodes.get(i*ds.columns + j), nodes.get(i*ds.columns + j ), nodes.get((i-1)*ds.columns + j + 1), cost);
+      edges.add(dirE);
+      Edge dirF = new Edge("4d" + nodes.get(i*ds.columns + j), nodes.get((i-1)*ds.columns + j + 1), nodes.get(i*ds.columns + j), cost);
+      edges.add(dirF); 
+      }
+  } 
+}
+for (int i = 0; i < ds.rows - 1; i++) {
+for (int j = 0; j < ds.columns; j++) { // Add vertical links in both directions 
+    cost = 2;
+    
+    if(ds.ObstacleMatrix[i + 1][j] != 0){
+       continue;
+    }
+    Edge dirC = new Edge("d" + nodes.get(i*ds.columns + j), nodes.get(i*ds.columns + j ), nodes.get((i+1)*ds.columns + j ), cost);
+    edges.add(dirC);
+    Edge dirD = new Edge("u" + nodes.get(i*ds.columns + j), nodes.get((i+1)*ds.columns + j), nodes.get(i*ds.columns + j ), cost);
+    edges.add(dirD);
+} 
+}
+
+Graph graph = new Graph(nodes, edges);
+DijkstrasAlgorithm dijkstra = new DijkstrasAlgorithm(graph);
+int startnode = 0;      
+int endnode = 0;
+// ❌ Rensa tidigare ritad väg från ObstacleMatrix
+
+
+
+// Convert from Location coordinates to node id
+for (int j = 0; j < ds.locations-1; j++) {
+    if (visitedPoints[j]) continue;
+    
+              switch (ds.Direction[j+1]) {
+                
+                 case 'N':
+                     {
+                         if(j == 0){
+                         int x = (int)(ds.robotX/ds.gridsize);
+                         int y = (int)(ds.robotY/ds.gridsize);
+                
+                         startnode = (int)((y)* ds.columns) + (x);
+                         x = (int)(ds.LocationX[j+1]/ds.gridsize);
+                         y = (int)(ds.LocationY[j+1]/ds.gridsize);
+                         endnode = (int)((y+1) * ds.columns) + x;   
+                         break;
+                         }
+                         else{
+                         int x = 0;
+                         int y = 0;
+                         startnode = endnode;
+                         x = (int)(ds.LocationX[j+1]/ds.gridsize);
+                         y = (int)(ds.LocationY[j+1]/ds.gridsize);
+                         endnode = (int)((y+1)* ds.columns) + (x);
+                         break;
+                         }
+                         
+                         
+                         
+                     }
+                 case 'E':
+                     {
+                         if(j == 0 || !ds.path.isEmpty()){
+                         int x = (int)(ds.robotX/ds.gridsize);
+                         int y = (int)(ds.robotY/ds.gridsize);
+                
+                         startnode = (int)((y)* ds.columns) + x;
+                         x = (int)(ds.LocationX[j+1]/ds.gridsize);
+                         y = (int)(ds.LocationY[j+1]/ds.gridsize);
+                         endnode = (int)((y) * ds.columns) + x+1; 
+                         break;
+                         }
+                         else{
+                         int x = 0;
+                         int y = 0;
+                         startnode = endnode;
+                         x = (int)(ds.LocationX[j+1]/ds.gridsize);
+                         y = (int)(ds.LocationY[j+1]/ds.gridsize);
+                         endnode = (int)(y * ds.columns) + x+1;
+                         break;
+                         }           
+                     }
+                 case 'W':
+                    {
+                         if(j == 0|| !ds.path.isEmpty()){
+                         int x = (int)(ds.robotX/ds.gridsize);
+                         int y = (int)(ds.robotY/ds.gridsize);
+                
+                         startnode = (int)((y)* ds.columns) + x;
+                         x = (int)(ds.LocationX[j+1]/ds.gridsize);
+                         y = (int)(ds.LocationY[j+1]/ds.gridsize);
+                         endnode = (int)((y) * ds.columns) + x-1;     
+                         break;
+                         }
+                         else{
+                         int x = 0;
+                         int y = 0;
+                         startnode = endnode;
+                         x = (int)(ds.LocationX[j+1]/ds.gridsize);
+                         y = (int)(ds.LocationY[j+1]/ds.gridsize);
+                         endnode = (int)(y * ds.columns) + x-1;
+                         break;
+                         }                                                
+                     }
+                 case 'S':
+                     {
+                         if(j == 0 || !ds.path.isEmpty()){
+                         int x = (int)(ds.robotX/ds.gridsize);
+                         int y = (int)(ds.robotY/ds.gridsize);
+                
+                         startnode = (int)((y)* ds.columns) + x;
+                         x = (int)(ds.LocationX[j+1]/ds.gridsize);
+                         y = (int)(ds.LocationY[j+1]/ds.gridsize);
+                         endnode = (int)((y-1) * ds.columns) + x;    
+                         break;
+                         }
+                         else{
+                         int x = 0;
+                         int y = 0;
+                         startnode = endnode;
+                         x = (int)(ds.LocationX[j+1]/ds.gridsize);
+                         y = (int)(ds.LocationY[j+1]/ds.gridsize);
+                         endnode = (int)((y-1) * ds.columns) + (x);
+                         break;
+                         }
+                         
+                         
+                         
+                     }
+                 default:
+                         
+                         break;
+                         
+             }
+ System.out.println(ds.Direction);
+
+
+//ds.antalrut = path.size();
+//ds.xrobpos = new double[path.size()];
+//ds.yrobpos = new double[path.size()];
+// Kontrollera om målpunkten redan är besökt
+//if (isVisited((int)(ds.LocationX[j+1] / ds.gridsize), (int)(ds.LocationY[j+1] / ds.gridsize))) {
+  //  System.out.println("⚠️ Hoppar över redan besökt punkt: (" + ds.LocationX[j+1] + ", " + ds.LocationY[j+1] + ")");
+    //continue; // Hoppa över om redan besökt
+//}
+
+    dijkstra.execute(nodes.get(startnode));
+ds.path = dijkstra.getPath(nodes.get(endnode));
+//ds.cumulativePath.addAll(ds.path);
+//ds.copypath = new LinkedList<> (path);
+/*
+int counter = 0;
+while (counter < 10) {
+    ds.path = dijkstra.getPath(nodes.get(endnode));
+    if (ds.path == null || ds.path.isEmpty()) {
+        System.out.println("❌ Ingen väg hittades från " + startnode + " till " + endnode);
+        counter++;
+        try { Thread.sleep(500); } catch (InterruptedException e) {}    }
+    else {
+        break;
+    }
+}
+*/
+try { Thread.sleep(5000); } catch (InterruptedException e) {}    
+if (ds.path == null || ds.path.isEmpty()) {
+    System.out.println("❌ Ingen väg hittades från " + startnode + " till " + endnode);
+    return;  // Avbryt ruttplaneringen
+}
+//while (ds.path == null || ds.path.isEmpty())
+
+//try (PrintWriter cmdWriter = new PrintWriter(new FileWriter("command.txt"))) {
+// Hämta kortaste vägen
+
+for (int i = 0; i < ds.path.size()-1; i++) {
+    int ipos = (int)(Integer.parseInt(ds.path.get(i).getId()) / ds.columns);
+    int jpos = Integer.parseInt(ds.path.get(i).getId()) - ipos * ds.columns;
+    
+
+    // Markera rutten (kan vara kvar)
+    ds.ObstacleMatrix[ipos][jpos] = 3;
+    
+}
+
+for (int i = 0; i < ds.path.size() - 1;) {
+    Vertex sistaNod = ds.path.get(ds.path.size()-1);
+     int sistaNodenX = (int) (Integer.parseInt(sistaNod.getId()) / ds.columns);
+    int sistaNodenY = Integer.parseInt(sistaNod.getId()) - sistaNodenX * ds.columns;
+
+    int ipos1 = (int) (Integer.parseInt(ds.path.get(i).getId()) / ds.columns);
+    int jpos1 = Integer.parseInt(ds.path.get(i).getId()) - ipos1 * ds.columns;
+
+    int ipos2 = (int) (Integer.parseInt(ds.path.get(i + 1).getId()) / ds.columns);
+    int jpos2 = Integer.parseInt(ds.path.get(i + 1).getId()) - ipos2 * ds.columns;
+
+    double directionV = 0.0;
+    String direction = "";
+
+    // Bestäm riktning
+    if (ipos2 == ipos1 && jpos2 == jpos1 + 1) {
+        direction = "0"; directionV = 0.0;
+    } else if (ipos2 == ipos1 && jpos2 == jpos1 - 1) {
+        direction = "180"; directionV = 180.0;
+    } else if (jpos2 == jpos1 && ipos2 == ipos1 + 1) {
+        direction = "90"; directionV = 90.0;
+    } else if (jpos2 == jpos1 && ipos2 == ipos1 - 1) {
+        direction = "270"; directionV = 270.0;
+    } else if (ipos2 == ipos1 + 1 && jpos2 == jpos1 + 1) {
+        direction = "45"; directionV = 45.0;
+    } else if (ipos2 == ipos1 + 1 && jpos2 == jpos1 - 1) {
+        direction = "135"; directionV = 135.0;
+    } else if (ipos2 == ipos1 - 1 && jpos2 == jpos1 - 1) {
+        direction = "225"; directionV = 225.0;
+    } else if (ipos2 == ipos1 - 1 && jpos2 == jpos1 + 1) {
+        direction = "315"; directionV = 315.0;
+    }
+
+   
+
+    int finalRow = ipos2;
+    int finalCol = jpos2;
+
+    // Sammanhängande rörelse
+    int length = 1;
+    int nextIpos, nextJpos;
+    while (i + length < ds.path.size()) {
+        nextIpos = (int) (Integer.parseInt(ds.path.get(i + length).getId()) / ds.columns);
+        nextJpos = Integer.parseInt(ds.path.get(i + length).getId()) - nextIpos * ds.columns;
+
+        // Kontrollera om riktningen ändras
+        if ((direction.equals("0") && nextJpos == jpos1 + length) ||
+            (direction.equals("180") && nextJpos == jpos1 - length) ||
+            (direction.equals("90") && nextIpos == ipos1 + length) ||
+            (direction.equals("270") && nextIpos == ipos1 - length) ||
+            (direction.equals("45") && nextIpos == ipos1 + length && nextJpos == jpos1 + length) ||
+            (direction.equals("135") && nextIpos == ipos1 + length && nextJpos == jpos1 - length) ||
+            (direction.equals("225") && nextIpos == ipos1 - length && nextJpos == jpos1 - length) ||
+            (direction.equals("315") && nextIpos == ipos1 - length && nextJpos == jpos1 + length)) {
+            finalRow = nextIpos;
+            finalCol = nextJpos;
+            length++;
+        } else {
+            break;
+        }
+    }
+     double rotation = calculateRotation(ds.agvDirection, directionV);
+                  
+    updateDirection(directionV);
+
+    // Skicka kommandot till AGV:n med den sista noden i sträckan
+    String command = "GT," + finalCol * ds.gridsize + "," + finalRow * ds.gridsize +"," + rotation;
+    System.out.println("➡️ Skickar riktning: " + command);
+    bt.sendDirection(command);
+
+    // Vänta tills AGV:n når mål
+    boolean nodeReached = false;
+    
+    bt.targetReached = false;
+    while (!bt.targetReached) {
+        try { Thread.sleep(50); } catch (InterruptedException e) {}
+    }
+    nodeReached = true; // Nu har Target_reached tagits emot!
+    bt.targetReached = false; // Återställ för säkerhets skull
+   /*       while (!nodeReached) {
+        double currentX = ds.robotX;
+        double currentY = ds.robotY;
+
+        double distanceX = Math.abs((finalCol * ds.gridsize) - currentX);
+        double distanceY = Math.abs((finalRow * ds.gridsize) - currentY);
+        
+        System.out.println("sista"+sistaNodenX+ ","+ sistaNodenY);
+       System.out.println(finalCol+ ","+ finalRow);
+        bt.waitForTargetReached();
+        
+        try {
+            Thread.sleep(300);
+        } catch (InterruptedException e) {
+            System.out.println("Väntan avbruten: " + e.getMessage());
+        }
+*/
+        //bt.clearLidarHistory();  // denna
+
+        nodeReached = true;
+        System.out.println("✅ Nått nod: via Target_reached");
+
+       
+        
+             if (finalRow == sistaNodenX && finalCol == sistaNodenY) {
+            //bt.sendLjusCommand(); // LÄD OPTPLAN
+            //System.out.println("🔄 Skickade R");
+            //bt.waitForAck(); // väntar på UPG_klar t.ex.
+            bt.ackReceived = false;
+            bt.sendLjusCommand();
+            System.out.println("🔄 Skickade R");
+            bt.waitForAck();
+            visitedPoints[currentTargetIndex] = true;
+            currentTargetIndex++;  // eller uppdatera beroende på din logik
+
+            bt.ackReceived = false;
+           // ds.LocationX[k] = -1;
+            //ds.LocationY[k] = -1;
+            //break;
+        }
+        try {
+            Thread.sleep(50);
+        } catch (InterruptedException e) {
+            System.out.println("⚠️ Väntan avbruten: " + e.getMessage());
+        }
+    
+
+    // Markera noden som besökt
+ 
+     
+    // Gå vidare till nästa nod
+    i += length;
+    
+    }
+
+    k = k +1;
+
+}
+
+
+//ds.path.clear();
+
+
+}
+
+}
+    
+
+    
