@@ -1,0 +1,54 @@
+package autonavigate;
+
+public class AutoNavigate {
+
+    DataStore ds;
+    ControlUIny cui;
+    OptPlan op;
+    Discoverpath kr;
+    BluetoothClient btClient;
+
+    AutoNavigate() {
+        // Initierar datalagringen som hanterar all global information
+        ds = new DataStore();
+
+        // Anger filnamn och läser in koordinater från textfil
+        ds.setFileName("loc.txt");
+        ds.readCoords();
+        ds.computeOptimalOrder();
+
+        // Skapar och visar användargränssnittet
+        cui = new ControlUIny(ds);
+        cui.setVisible(true);
+        cui.showStatus();
+        cui.setAutoNavigate(this);
+
+        // Lägger till buffertzoner runt besökspunkter med tillgängliga infarter
+        ds.AddBufferZonesWithEntrance();
+
+        // Skapar och kopplar in Bluetooth-klienten till GUI och datalager
+        btClient = new BluetoothClient(cui, ds, this);
+        cui.setBluetoothClient(btClient);
+
+        // Initierar ruttplanerare och kartläggningsfunktion
+        op = new OptPlan(ds, btClient);
+        kr = new Discoverpath(ds, btClient);
+    }
+
+    public void startRouteplanning() {
+        op.createPlan1();
+        cui.repaint();
+    }
+
+    public void startMapplanning() {
+        System.out.println("🔄 Initierar ruttplanering...");
+        kr.createPlan2();
+        System.out.println("✅ Ruttplanering startad.");
+        cui.repaint();
+    }
+
+    public static void main(String[] args) {
+        // Startar hela applikationen genom att skapa ett AutoNavigate-objekt
+        AutoNavigate x = new AutoNavigate();
+    }
+}
