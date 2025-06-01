@@ -1,0 +1,456 @@
+/*
+ * Click nbfs://nbhost/SystemFileSystem/Templates/Licenses/license-default.txt to change this license
+ * Click nbfs://nbhost/SystemFileSystem/Templates/Classes/Class.java to edit this template
+ */
+package autonavigate;
+
+import java.util.ArrayList;
+import java.util.LinkedList;
+import java.util.List;
+import java.io.*;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+
+    
+
+       
+
+
+/**
+ *
+ * @author christianchamaly
+ */
+public class Discoverpath {
+    private List<Vertex> nodes;
+    private List<Edge> edges;
+    private DataStore ds;
+   private BluetoothClient bt;
+   private ControlUIny gui;
+   private List<String> visitedPoints = new ArrayList<>();
+    double[] LocationX2;
+    double[] LocationY2; 
+    
+        
+   
+    
+    public Discoverpath(DataStore ds, BluetoothClient bt) {
+        this.ds = ds;
+        this.bt = bt;
+        
+    
+ 
+    }
+
+    // Funktion som översätter väderstreck till vinkel
+private double getRotationFromDirection(char riktning) {
+    switch (riktning) {
+        case 'N': return 90.0;
+        case 'E': return 0.0;
+        case 'S': return 270.0;
+        case 'W': return 180.0;
+        default: 
+            System.out.println("⚠️ Okänd riktning: " + riktning);
+            return 0.0; // Standardvärde om inget matchar
+    }
+}
+
+
+    private boolean isVisited(int x, int y) {
+    for (int i = 0; i < ds.locations; i++) {
+        if ((int)(ds.LocationX[i] / ds.gridsize) == x && (int)(ds.LocationY[i] / ds.gridsize) == y) {
+            return true;
+        }
+    }
+    return false;
+}
+  private double calculateRotation(double currentDirection, double directionV) {
+    double rotation = directionV - currentDirection;
+    // Justera rotation till intervallet [-180, 180]
+    if (rotation >= 180) rotation -= 360;
+    if (rotation <= -180) rotation += 360;
+    return rotation;
+}
+  private void updateDirection(double newDirection) {
+    ds.agvDirection = newDirection % 360;
+    if (ds.agvDirection < 0) ds.agvDirection += 360;
+    System.out.println("🔄 Uppdaterad riktning: " + ds.agvDirection);
+}
+
+
+
+
+    
+    public void createPlan2(){
+       
+    
+
+
+ int k = 0;
+         nodes = new ArrayList<Vertex>();
+         edges = new ArrayList<Edge>();
+         
+         
+// Set up grid network for path finding
+for (int i = 0; i < ds.columns; i++) { 
+   for (int j = 0; j < ds.rows; j++) {
+     
+        Vertex location = new Vertex("" + (i*ds.rows + j), "Nod #" + (i*ds.rows + j)); ;
+        nodes.add(location);
+    }
+}
+System.out.println("columns: "+ds.columns);
+System.out.println("rows: "+ds.rows);
+
+double cost = 1;
+
+
+for (int i = 0; i < ds.rows; i++) {
+  for (int j = 0; j < ds.columns - 1 ; j++) { // Add horizontal links in both directions
+      cost = 1;
+        if (ds.ObstacleMatrix[i][j] != 0 || ds.ObstacleMatrix[i][j + 1] != 0) {
+            continue;
+        }    
+
+      Edge dirA = new Edge("r" + nodes.get(i*ds.columns + j), nodes.get(i*ds.columns + j ), nodes.get(i*ds.columns + j + 1), cost);
+      edges.add(dirA);
+      Edge dirB = new Edge("l" + nodes.get(i*ds.columns + j), nodes.get(i*ds.columns + j + 1), nodes.get(i*ds.columns + j), cost);
+      edges.add(dirB);
+      // Om du återaktiverar diagonal logik, se till att den också kontrollerar mellanliggande celler korrekt.
+      // För nu antar vi att den är korrekt bortkommenterad eller inte används aktivt baserat på tidigare diskussion.
+      /*
+      if(i < ds.rows - 1 ){
+          cost = 500;
+          if(ds.ObstacleMatrix[i + 1][j + 1] != 0 || ds.ObstacleMatrix[i][j+1] != 0 || ds.ObstacleMatrix[i+1][j] != 0){ // Exempel på korrekt kontroll för diagonal
+              continue;
+          }
+          Edge dirC = new Edge("1d" + nodes.get(i*ds.columns + j), nodes.get(i*ds.columns + j ), nodes.get((i+1)*ds.columns + j + 1), cost);
+          edges.add(dirC);
+          Edge dirD = new Edge("2d" + nodes.get(i*ds.columns + j), nodes.get((i+1)*ds.columns + j + 1), nodes.get(i*ds.columns + j), cost);
+          edges.add(dirD); 
+      }
+      if(i > 0){ 
+          cost = 500;
+          if(ds.ObstacleMatrix[i - 1][j + 1] != 0 || ds.ObstacleMatrix[i][j+1] != 0 || ds.ObstacleMatrix[i-1][j] != 0){ // Exempel på korrekt kontroll för diagonal
+              continue;
+          }
+          Edge dirE = new Edge("3d" + nodes.get(i*ds.columns + j), nodes.get(i*ds.columns + j ), nodes.get((i-1)*ds.columns + j + 1), cost);
+          edges.add(dirE);
+          Edge dirF = new Edge("4d" + nodes.get(i*ds.columns + j), nodes.get((i-1)*ds.columns + j + 1), nodes.get(i*ds.columns + j), cost);
+          edges.add(dirF); 
+      }
+      */
+  } 
+}
+
+// =======================================================================
+// START PÅ KODBLOCK ATT UPPDATERA/ERSÄTTA
+// =======================================================================
+for (int i = 0; i < ds.rows - 1; i++) {
+  for (int j = 0; j < ds.columns; j++) { // Add vertical links in both directions 
+    cost = 2;
+    
+    // KORRIGERAD KOD: Kontrollera om NÅGON av de två cellerna (aktuell eller den under) är ett hinder
+    if (ds.ObstacleMatrix[i][j] != 0 || ds.ObstacleMatrix[i + 1][j] != 0) {
+       continue; // Hoppa över om någon cell är ett hinder
+    }
+    // Om båda är fria, lägg till kanterna
+    Edge dirC = new Edge("d" + nodes.get(i*ds.columns + j), nodes.get(i*ds.columns + j ), nodes.get((i+1)*ds.columns + j ), cost);
+    edges.add(dirC);
+    Edge dirD = new Edge("u" + nodes.get(i*ds.columns + j), nodes.get((i+1)*ds.columns + j), nodes.get(i*ds.columns + j ), cost);
+    edges.add(dirD);
+  } 
+}
+// =======================================================================
+// SLUT PÅ KODBLOCK ATT UPPDATERA/ERSÄTTA
+// =======================================================================
+
+Graph graph = new Graph(nodes, edges);
+DijkstrasAlgorithm dijkstra = new DijkstrasAlgorithm(graph);
+int startnode = 0;      
+int endnode = 0;
+// ❌ Rensa tidigare ritad väg från ObstacleMatrix
+
+
+
+// Convert from Location coordinates to node id
+for (int j_loop = 0; j_loop < ds.locations-1; j_loop++) { // Bytte namn på loopvariabeln j till j_loop för tydlighet
+    
+    
+              switch (ds.Direction[j_loop+1]) { // Använd j_loop här
+                
+                 case 'N':
+                     {
+                         if(j_loop == 0){ // Använd j_loop här
+                         int x = (int)(ds.robotX/ds.gridsize);
+                         int y = (int)(ds.robotY/ds.gridsize);
+                
+                         startnode = (int)((y)* ds.columns) + (x);
+                         x = (int)(ds.LocationX[j_loop+1]/ds.gridsize); // Använd j_loop här
+                         y = (int)(ds.LocationY[j_loop+1]/ds.gridsize); // Använd j_loop här
+                         endnode = (int)((y+3) * ds.columns) + x;   
+                         break;
+                         }
+                         else{
+                         int x = 0;
+                         int y = 0;
+                         startnode = endnode;
+                         x = (int)(ds.LocationX[j_loop+1]/ds.gridsize); // Använd j_loop här
+                         y = (int)(ds.LocationY[j_loop+1]/ds.gridsize); // Använd j_loop här
+                         endnode = (int)((y+3)* ds.columns) + (x);
+                         break;
+                         }
+                         
+                         
+                         
+                     }
+                 case 'E':
+                     {
+                         if(j_loop == 0){ // Använd j_loop här
+                         int x = (int)(ds.robotX/ds.gridsize);
+                         int y = (int)(ds.robotY/ds.gridsize);
+                
+                         startnode = (int)((y)* ds.columns) + x;
+                         x = (int)(ds.LocationX[j_loop+1]/ds.gridsize); // Använd j_loop här
+                         y = (int)(ds.LocationY[j_loop+1]/ds.gridsize); // Använd j_loop här
+                         endnode = (int)((y) * ds.columns) + x+3; 
+                         break;
+                         }
+                         else{
+                         int x = 0;
+                         int y = 0;
+                         startnode = endnode;
+                         x = (int)(ds.LocationX[j_loop+1]/ds.gridsize); // Använd j_loop här
+                         y = (int)(ds.LocationY[j_loop+1]/ds.gridsize); // Använd j_loop här
+                         endnode = (int)(y * ds.columns) + x+3;
+                         break;
+                         }           
+                     }
+                 case 'W':
+                    {
+                         if(j_loop == 0){ // Använd j_loop här
+                         int x = (int)(ds.robotX/ds.gridsize);
+                         int y = (int)(ds.robotY/ds.gridsize);
+                
+                         startnode = (int)((y)* ds.columns) + x;
+                         x = (int)(ds.LocationX[j_loop+1]/ds.gridsize); // Använd j_loop här
+                         y = (int)(ds.LocationY[j_loop+1]/ds.gridsize); // Använd j_loop här
+                         endnode = (int)((y) * ds.columns) + x-3;     
+                         break;
+                         }
+                         else{
+                         int x = 0;
+                         int y = 0;
+                         startnode = endnode;
+                         x = (int)(ds.LocationX[j_loop+1]/ds.gridsize); // Använd j_loop här
+                         y = (int)(ds.LocationY[j_loop+1]/ds.gridsize); // Använd j_loop här
+                         endnode = (int)(y * ds.columns) + x-3;
+                         break;
+                         }                                                
+                     }
+                 case 'S':
+                     {
+                         if(j_loop == 0){ // Använd j_loop här
+                         int x = (int)(ds.robotX/ds.gridsize);
+                         int y = (int)(ds.robotY/ds.gridsize);
+                
+                         startnode = (int)((y)* ds.columns) + x;
+                         x = (int)(ds.LocationX[j_loop+1]/ds.gridsize); // Använd j_loop här
+                         y = (int)(ds.LocationY[j_loop+1]/ds.gridsize); // Använd j_loop här
+                         endnode = (int)((y-3) * ds.columns) + x;    
+                         break;
+                         }
+                         else{
+                         int x = 0;
+                         int y = 0;
+                         startnode = endnode;
+                         x = (int)(ds.LocationX[j_loop+1]/ds.gridsize); // Använd j_loop här
+                         y = (int)(ds.LocationY[j_loop+1]/ds.gridsize); // Använd j_loop här
+                         endnode = (int)((y-3) * ds.columns) + (x);
+                         break;
+                         }
+                         
+                         
+                         
+                     }
+                 default:
+                         
+                         break;
+                         
+             }
+ System.out.println(ds.Direction);
+
+
+//ds.antalrut = path.size();
+//ds.xrobpos = new double[path.size()];
+//ds.yrobpos = new double[path.size()];
+// Kontrollera om målpunkten redan är besökt
+//if (isVisited((int)(ds.LocationX[j_loop+1] / ds.gridsize), (int)(ds.LocationY[j_loop+1] / ds.gridsize))) {
+  //  System.out.println("⚠️ Hoppar över redan besökt punkt: (" + ds.LocationX[j_loop+1] + ", " + ds.LocationY[j_loop+1] + ")");
+    //continue; // Hoppa över om redan besökt
+//}
+
+    dijkstra.execute(nodes.get(startnode));
+ds.path = dijkstra.getPath(nodes.get(endnode));
+//ds.cumulativePath.addAll(ds.path);
+//ds.copypath = new LinkedList<> (path);
+
+if (ds.path == null || ds.path.isEmpty()) {
+    System.out.println("❌ Ingen väg hittades från " + startnode + " till " + endnode);
+    // Om du är i en loop som försöker hitta vägar till flera punkter (vilket for-loopen med j_loop antyder),
+    // bör du använda 'continue' här för att gå till nästa målpunkt istället för 'return'.
+    // Om detta är den enda vägsökningen, är 'return' ok.
+    continue; // Fortsätt till nästa j_loop iteration
+}
+
+//try (PrintWriter cmdWriter = new PrintWriter(new FileWriter("command.txt"))) {
+// Hämta kortaste vägen
+for (int i = 0; i < ds.path.size()-1; i++) {
+    int ipos = (int)(Integer.parseInt(ds.path.get(i).getId()) / ds.columns);
+    int jpos = Integer.parseInt(ds.path.get(i).getId()) - ipos * ds.columns;
+    
+
+    // Markera rutten (kan vara kvar)
+    // VARNING: Om denna kod körs samtidigt som LIDAR-tråden uppdaterar ds.ObstacleMatrix
+    // utan synkronisering, kan det leda till problem.
+    ds.ObstacleMatrix[ipos][jpos] = 3; 
+    //gui.repaint();
+    
+}
+for (int i = 0; i < ds.path.size() - 1;) {
+
+    int ipos1 = (int) (Integer.parseInt(ds.path.get(i).getId()) / ds.columns);
+    int jpos1 = Integer.parseInt(ds.path.get(i).getId()) - ipos1 * ds.columns;
+
+    int ipos2 = (int) (Integer.parseInt(ds.path.get(i + 1).getId()) / ds.columns);
+    int jpos2 = Integer.parseInt(ds.path.get(i + 1).getId()) - ipos2 * ds.columns;
+
+    double directionV = 0.0;
+    String direction = "";
+
+    // Bestäm riktning
+    if (ipos2 == ipos1 && jpos2 == jpos1 + 1) {
+        direction = "0"; directionV = 0.0;
+    } else if (ipos2 == ipos1 && jpos2 == jpos1 - 1) {
+        direction = "180"; directionV = 180.0;
+    } else if (jpos2 == jpos1 && ipos2 == ipos1 + 1) {
+        direction = "90"; directionV = 90.0;
+    } else if (jpos2 == jpos1 && ipos2 == ipos1 - 1) {
+        direction = "270"; directionV = 270.0;
+    } else if (ipos2 == ipos1 + 1 && jpos2 == jpos1 + 1) {
+        direction = "45"; directionV = 45.0; // Diagonal
+    } else if (ipos2 == ipos1 + 1 && jpos2 == jpos1 - 1) {
+        direction = "135"; directionV = 135.0; // Diagonal
+    } else if (ipos2 == ipos1 - 1 && jpos2 == jpos1 - 1) {
+        direction = "225"; directionV = 225.0; // Diagonal
+    } else if (ipos2 == ipos1 - 1 && jpos2 == jpos1 + 1) {
+        direction = "315"; directionV = 315.0; // Diagonal
+    }
+
+    double rotation = calculateRotation(ds.agvDirection, directionV);
+                  
+    updateDirection(directionV);
+
+    int finalRow = ipos2;
+    int finalCol = jpos2;
+
+    // Sammanhängande rörelse
+    int length = 1;
+    int nextIpos, nextJpos;
+    while (i + length < ds.path.size()) {
+        nextIpos = (int) (Integer.parseInt(ds.path.get(i + length).getId()) / ds.columns);
+        nextJpos = Integer.parseInt(ds.path.get(i + length).getId()) - nextIpos * ds.columns;
+
+        // Kontrollera om riktningen ändras (inklusive diagonaler)
+        if ((direction.equals("0") && nextJpos == jpos1 + length && nextIpos == ipos1) || // Korrigerat för att säkerställa rak linje
+            (direction.equals("180") && nextJpos == jpos1 - length && nextIpos == ipos1) || // Korrigerat
+            (direction.equals("90") && nextIpos == ipos1 + length && nextJpos == jpos1) || // Korrigerat
+            (direction.equals("270") && nextIpos == ipos1 - length && nextJpos == jpos1) || // Korrigerat
+            (direction.equals("45") && nextIpos == ipos1 + length && nextJpos == jpos1 + length) ||
+            (direction.equals("135") && nextIpos == ipos1 + length && nextJpos == jpos1 - length) ||
+            (direction.equals("225") && nextIpos == ipos1 - length && nextJpos == jpos1 - length) ||
+            (direction.equals("315") && nextIpos == ipos1 - length && nextJpos == jpos1 + length)) {
+            finalRow = nextIpos;
+            finalCol = nextJpos;
+            length++;
+        } else {
+            break;
+        }
+    }
+
+    // Skicka kommandot till AGV:n med den sista noden i sträckan
+    String command = "GT," + finalCol * ds.gridsize + "," + finalRow * ds.gridsize +"," + rotation;
+    System.out.println("➡️ Skickar riktning: " + command);
+    bt.sendDirection(command);
+
+    // Vänta tills AGV:n når målnoden (inom ±5 cm)
+    boolean nodeReached = false;
+    while (!nodeReached) {
+        double currentX = ds.robotX;
+        double currentY = ds.robotY;
+
+        double distanceX = Math.abs((finalCol * ds.gridsize) - currentX);
+        double distanceY = Math.abs((finalRow * ds.gridsize) - currentY);
+//        System.out.println(sistaNodenX+ ","+ sistaNodenY);
+        if (distanceX <= 22 && distanceY <=13) {//ÄNDRA OM NI VILL
+            nodeReached = true;
+            System.out.println("✅ Nått nod: (" + currentX + ", " + currentY + ")");
+      
+            // Du använder 'k' här, men 'k' inkrementeras längre ner.
+            // Det kan vara så att du vill använda 'j_loop' om det är kopplat till den yttre loopen för målpunkter.
+            // ds.LocationX[k] = -1; 
+            // ds.LocationY[k] = -1;
+            break;
+        }
+        
+       
+    }
+        try {
+            Thread.sleep(50);
+        } catch (InterruptedException e) {
+            System.out.println("⚠️ Väntan avbruten: " + e.getMessage());
+        }
+    
+
+    // Markera noden som besökt
+    int x_coord = finalCol * ds.gridsize; // Bytte namn på variabeln x till x_coord
+    int y_coord = finalRow * ds.gridsize; // Bytte namn på variabeln y till y_coord
+    // Loopvariabeln 'k' här nere verkar vara den som ska användas för att markera ds.LocationX/Y.
+    // Se till att 'k' har rätt värde som motsvarar den aktuella målpunkten från den yttre loopen (j_loop).
+    // Det verkar som att 'k' ska vara 'j_loop' om du vill markera den aktuella målpunkten som besökt.
+    // Om 'k' är en separat räknare, se till att den hanteras korrekt.
+    // Just nu inkrementeras 'k' i slutet av for-loopen för 'i', vilket kan vara fel.
+    // Jag antar att 'k' ska relatera till 'j_loop' för att markera rätt LocationX/Y.
+    // Om du vill markera den *aktuella* målpunkten (från yttre loopen j_loop) som nådd:
+    if (ds.LocationX.length > j_loop && ds.LocationY.length > j_loop) { // Säkerhetskoll
+        // Denna logik verkar försöka matcha den nådda noden med en i listan.
+        // Det är dock oklart om 'k' är rätt index här.
+        // Om målet var att markera ds.LocationX[j_loop] som nådd, borde det ske mer direkt.
+        // ds.LocationX[j_loop] = -1; 
+        // ds.LocationY[j_loop] = -1;
+    }
+     
+    // Gå vidare till nästa nod
+    i += length;
+    // 'k' inkrementeras här, men dess användning ovan är oklar i relation till 'j_loop'
+    // Om 'k' är tänkt att spåra segment inom en enskild väg (ds.path), då är det ok.
+    // Men om det är för att markera målpunkter från ds.locations, bör det kopplas till j_loop.
+    // k = k +1; // Denna 'k' är deklarerad i början av createPlan2. 
+                // Dess användning i slutet av inre loopen och relation till yttre loopen (j_loop) behöver ses över.
+                // Om 'k' ska räkna antalet besökta punkter från ds.locations, bör den inkrementeras
+                // i den yttre loopen (j_loop) när en hel väg till en ds.LocationX[j_loop] är klar.
+}
+
+// Inkrementera 'k' här om 'k' är tänkt att räkna antalet bearbetade målpunkter från ds.locations
+// k = k+1; // Flytta eventuellt 'k'-inkrementeringen hit, relaterat till yttre loopen 'j_loop'
+
+} // Slut på yttre for-loop (j_loop)
+
+
+
+
+    }
+    
+    
+
+}
